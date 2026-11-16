@@ -26,12 +26,15 @@ import json
 import time
 import datetime
 import subprocess
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 import cv2
+import numpy as np
 import requests
 from PIL import Image, ImageTk
 
@@ -60,7 +63,10 @@ EXPORT_DIR = DATA_DIR / "Exports"
 CARDS_FILE = DATA_DIR / "cards.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
-PREVIEW_W, PREVIEW_H = 640, 400
+PREVIEW_W, PREVIEW_H = 640, 360
+RESOLUTIONS = [("1280 x 720", 1280, 720),
+               ("1920 x 1080 (sharper)", 1920, 1080),
+               ("640 x 480", 640, 480)]
 CARD_RATIO = 63 / 88
 BOX_HEIGHT_FRACTION = 0.88
 HEADERS = {"User-Agent": "MTGCardScannerApp/1.0", "Accept": "application/json"}
@@ -151,6 +157,13 @@ def _card_colors(c):
     return cols
 
 
+def _art_url(c):
+    uris = c.get("image_uris") or {}
+    if not uris and c.get("card_faces"):
+        uris = (c["card_faces"][0] or {}).get("image_uris") or {}
+    return uris.get("art_crop", "")
+
+
 def _parse_scryfall(c):
     p = c.get("prices", {})
     return {
@@ -160,6 +173,7 @@ def _parse_scryfall(c):
         "rarity": c.get("rarity", ""),
         "type_line": c.get("type_line", ""),
         "colors": _card_colors(c),
+        "art_url": _art_url(c),
         "price_nonfoil": _money(p.get("usd")),
         "price_foil": _money(p.get("usd_foil") or p.get("usd_etched")),
     }
@@ -177,10 +191,25 @@ def search_mtg(name):
             "https://api.scryfall.com/cards/named",
             params={"fuzzy": name}, headers=HEADERS, timeout=10,
         )
-        if r.status_code == 404:
-            return []
-        r.raise_for_status()
-        data = [r.json()]
+        if r.status_code == 200:
+            # re-search using the corrected name so we get every printing
+            fixed = r.json().get("name", name)
+            r2 = requests.get(
+                "https://api.scryfall.com/cards/search",
+                params={"q": f'!"{fixed}"', "unique": "prints", "order": "released"},
+                headers=HEADERS, timeout=10,
+            )
+            data = r2.json().get("data", []) if r2.status_code == 200 else [r.json()]
+        else:
+            # last resort: any card whose name contains the words we read
+            r3 = requests.get(
+                "https://api.scryfall.com/cards/search",
+                params={"q": name, "unique": "prints", "order": "released"},
+                headers=HEADERS, timeout=10,
+            )
+            if r3.status_code != 200:
+                return []
+            data = r3.json().get("data", [])
     else:
         r.raise_for_status()
         data = r.json().get("data", [])
@@ -202,17 +231,104 @@ def ocr_title(card_img):
     h, w = card_img.shape[:2]
     strip = card_img[int(h * 0.02):int(h * 0.14), int(w * 0.03):int(w * 0.82)]
     strip = cv2.resize(strip, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    try:
-        result, _ = _get_ocr_engine()(strip)
-    except Exception:
-        return "", "Couldn't read the title - please type the card name."
-    if not result:
-        return "", "Couldn't read the title - type the card name and press Search."
-    text = " ".join(str(r[1]) for r in result)
-    guess = "".join(ch for ch in text if ch.isalnum() or ch in " ',-:").strip()
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    boosted = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(gray)
+    sharp = cv2.addWeighted(boosted, 1.6, cv2.GaussianBlur(boosted, (0, 0), 3), -0.6, 0)
+    variants = (strip,
+                cv2.cvtColor(boosted, cv2.COLOR_GRAY2BGR),
+                cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR))
+
+    # try a few versions of the title strip and keep the most confident read
+    best_text, best_score = "", 0.0
+    for variant in variants:
+        try:
+            result, _ = _get_ocr_engine()(variant)
+        except Exception:
+            continue
+        if not result:
+            continue
+        try:
+            score = sum(float(r[2]) for r in result) / len(result)
+        except (TypeError, ValueError):
+            score = 0.5
+        if score > best_score:
+            best_text = " ".join(str(r[1]) for r in result)
+            best_score = score
+    guess = "".join(ch for ch in best_text if ch.isalnum() or ch in " ',-:").strip()
     if not guess:
         return "", "Couldn't read the title - type the card name and press Search."
     return guess, "Check the name below, fix it if needed, then pick the right printing."
+
+
+# ------------------------------------------------- image quality / artwork
+def sharpness_score(img):
+    """Bigger = sharper. Drives the live focus check and picks the best frame."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, (320, max(1, int(g.shape[0] * 320 / g.shape[1]))))
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+
+def sharpness_label(score):
+    if score < 40:
+        return "Blurry"
+    if score < 120:
+        return "OK"
+    return "Sharp"
+
+
+def art_region(card_img):
+    h, w = card_img.shape[:2]
+    return card_img[int(h * 0.12):int(h * 0.55), int(w * 0.08):int(w * 0.92)]
+
+
+def _prep_gray(img, width=400):
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    g = cv2.resize(g, (width, max(1, int(g.shape[0] * width / g.shape[1]))))
+    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+
+
+def pick_printing_by_art(card_img, matches):
+    """Compare the photographed artwork with each printing's artwork on Scryfall.
+    Returns (index, score) for a clear winner, or None when it isn't sure."""
+    candidates = [(i, m["art_url"]) for i, m in enumerate(matches) if m.get("art_url")]
+    if len(candidates) < 2:
+        return None
+    orb = cv2.ORB_create(nfeatures=1000)
+    kq, dq = orb.detectAndCompute(_prep_gray(art_region(card_img)), None)
+    if dq is None or len(kq) < 20:
+        return None
+
+    def fetch(url):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            return r.content
+        except requests.RequestException:
+            return None
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        blobs = list(ex.map(fetch, [u for _, u in candidates]))
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    scores = []
+    for (i, _), blob in zip(candidates, blobs):
+        good = 0
+        if blob:
+            try:
+                im = cv2.imdecode(np.frombuffer(blob, np.uint8), cv2.IMREAD_COLOR)
+                kt, dt = orb.detectAndCompute(_prep_gray(im), None)
+                if dt is not None and len(kt) >= 20:
+                    pairs = bf.knnMatch(dq, dt, k=2)
+                    good = sum(1 for p in pairs
+                               if len(p) == 2 and p[0].distance < 0.75 * p[1].distance)
+            except Exception:
+                good = 0
+        scores.append((good, i))
+    scores.sort(reverse=True)
+    best, second = scores[0], scores[1]
+    if best[0] >= 15 and best[0] >= 1.5 * max(second[0], 1):
+        return best[1], best[0]
+    return None
 
 
 # ------------------------------------------------------- filtering/sorting
@@ -330,6 +446,7 @@ class AddCardDialog(tk.Toplevel):
         self.finish_var = tk.StringVar(value=finish)
         self.value_var = tk.StringVar()
         self.msg_var = tk.StringVar(value=note)
+        self.card_img = card_img
         pad = {"padx": 8, "pady": 4}
 
         pil = Image.fromarray(cv2.cvtColor(card_img, cv2.COLOR_BGR2RGB))
@@ -407,7 +524,23 @@ class AddCardDialog(tk.Toplevel):
             return
         self._fill(self.matches)
         if self.matches:
-            self.msg_var.set(f"Found {len(self.matches)} printing(s). Pick the one you have.")
+            msg = f"Found {len(self.matches)} printing(s). Pick the one you have."
+            if len(self.matches) > 1:
+                self.msg_var.set(f"Found {len(self.matches)} printings - comparing artwork...")
+                self.update_idletasks()
+                try:
+                    hit = pick_printing_by_art(self.card_img, self.matches)
+                except Exception:
+                    hit = None
+                if hit:
+                    idx = hit[0]
+                    self.tree.selection_set(str(idx))
+                    self.tree.focus(str(idx))
+                    self.tree.see(str(idx))
+                    m = self.matches[idx]
+                    msg = (f"Found {len(self.matches)} printings. The artwork looks most like "
+                           f"{m['set']} #{m['number']} - check that it matches your card.")
+            self.msg_var.set(msg)
         else:
             self.msg_var.set("No match - check the spelling and search again, "
                              "or add it with a custom value below.")
@@ -466,6 +599,12 @@ class ScannerApp:
         self.color_var = tk.StringVar(value="All")
         self.sort_var = tk.StringVar(value=SORT_MODES[0][0])
         self.status_var = tk.StringVar(value=f"Your cards are saved in: {DATA_DIR}")
+        self.autofocus = tk.BooleanVar(value=bool(self.settings.get("autofocus", True)))
+        self.focus_value = tk.DoubleVar(value=float(self.settings.get("focus", 128)))
+        self.res_var = tk.StringVar(value=self.settings.get("resolution", RESOLUTIONS[0][0]))
+        self.sharp_var = tk.StringVar(value="Focus check: waiting for camera...")
+        self.frame_buffer = deque(maxlen=6)   # recent (sharpness, frame) pairs
+        self.frame_count = 0
 
         self.cap = None
         self.last_frame = None
@@ -508,18 +647,44 @@ class ScannerApp:
         ttk.Radiobutton(fbox, text="Foil", value="foil", variable=self.finish,
                         command=self.on_finish_change, takefocus=0).pack(side="left", padx=10, pady=4)
 
-        cbox = ttk.Frame(left)
-        cbox.pack(fill="x", pady=4)
-        ttk.Label(cbox, text="Camera number:").pack(side="left")
-        cam = ttk.Combobox(cbox, textvariable=self.camera_var, values=["0", "1", "2", "3"],
-                           width=4, state="readonly")
-        cam.pack(side="left", padx=6)
+        cam_box = ttk.LabelFrame(left, text="Camera")
+        cam_box.pack(fill="x", pady=4)
+
+        row1 = ttk.Frame(cam_box)
+        row1.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Label(row1, text="Camera #").pack(side="left")
+        cam = ttk.Combobox(row1, textvariable=self.camera_var, values=["0", "1", "2", "3"],
+                           width=3, state="readonly")
+        cam.pack(side="left", padx=(4, 12))
         cam.bind("<<ComboboxSelected>>", self.on_camera_change)
+        ttk.Label(row1, text="Quality").pack(side="left")
+        res = ttk.Combobox(row1, textvariable=self.res_var,
+                           values=[r[0] for r in RESOLUTIONS], width=20, state="readonly")
+        res.pack(side="left", padx=4)
+        res.bind("<<ComboboxSelected>>", self.on_camera_change)
+
+        row2 = ttk.Frame(cam_box)
+        row2.pack(fill="x", padx=8, pady=2)
+        ttk.Checkbutton(row2, text="Auto-focus", variable=self.autofocus,
+                        command=self.on_focus_change, takefocus=0).pack(side="left")
+        ttk.Label(row2, text="   Manual focus:").pack(side="left")
+        self.focus_scale = ttk.Scale(row2, from_=0, to=255, variable=self.focus_value,
+                                     orient="horizontal", length=170)
+        self.focus_scale.pack(side="left", padx=4)
+        self.focus_scale.bind("<ButtonRelease-1>", lambda e: self.on_focus_change())
+
+        row3 = ttk.Frame(cam_box)
+        row3.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Button(row3, text="Camera settings window", command=self.open_driver_settings,
+                   takefocus=0).pack(side="left")
+        ttk.Label(row3, textvariable=self.sharp_var,
+                  font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=10)
 
         ttk.Label(left, justify="left", foreground="#555555", text=(
-            "1. Put the card inside the green box\n"
-            "2. Press the Space bar (or click Snap card)\n"
-            "3. Confirm the name and pick the printing")).pack(anchor="w", pady=(8, 0))
+            "Tip: hold the card flat, about a hand-span from the camera, with\n"
+            "light on it but no glare. Wait for the Focus check to say Sharp,\n"
+            "then press Space. The sharpest of the last few frames is used.")
+                  ).pack(anchor="w", pady=(6, 0))
 
         # ---- right: filters, table, buttons
         right = ttk.Frame(root, padding=10)
@@ -582,11 +747,16 @@ class ScannerApp:
         idx = int(self.camera_var.get())
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(idx)
         if cap is not None and cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            _, rw, rh = next((r for r in RESOLUTIONS if r[0] == self.res_var.get()),
+                             RESOLUTIONS[0])
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
             self.cap = cap
+            self.apply_focus()
         else:
             self.cap = None
+        self.frame_buffer.clear()
 
     def update_preview(self):
         try:
@@ -610,6 +780,7 @@ class ScannerApp:
                      "another app, or try a different camera number below.")
             return
         self.last_frame = frame
+        self.track_sharpness(frame)
         h, w = frame.shape[:2]
         scale = min(PREVIEW_W / w, PREVIEW_H / h)
         small = cv2.resize(frame, (int(w * scale), int(h * scale)))
@@ -639,9 +810,51 @@ class ScannerApp:
 
     def on_camera_change(self, event=None):
         self.settings["camera_index"] = int(self.camera_var.get())
+        self.settings["resolution"] = self.res_var.get()
         save_json(SETTINGS_FILE, self.settings)
         self.open_camera()
         self.canvas.focus_set()
+
+    def apply_focus(self):
+        auto = self.autofocus.get()
+        self.focus_scale.state(["disabled"] if auto else ["!disabled"])
+        if self.cap is None:
+            return
+        try:  # not every camera supports these; failures are harmless
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if auto else 0)
+            if not auto:
+                self.cap.set(cv2.CAP_PROP_FOCUS, float(self.focus_value.get()))
+        except Exception:
+            pass
+
+    def on_focus_change(self):
+        self.settings["autofocus"] = bool(self.autofocus.get())
+        self.settings["focus"] = float(self.focus_value.get())
+        save_json(SETTINGS_FILE, self.settings)
+        self.apply_focus()
+        self.canvas.focus_set()
+
+    def open_driver_settings(self):
+        """Opens the camera maker's own settings window (focus, brightness...)."""
+        if self.cap is None:
+            messagebox.showinfo(APP_NAME, "The camera isn't working yet.")
+            return
+        try:
+            self.cap.set(cv2.CAP_PROP_SETTINGS, 1)
+            self.set_status("Opened the camera's own settings window "
+                            "(it may appear behind this window).")
+        except Exception:
+            messagebox.showinfo(APP_NAME, "This camera doesn't offer a settings window.")
+
+    def track_sharpness(self, frame):
+        """Score the card area of every frame; show the average every few frames."""
+        x1, y1, x2, y2 = card_box(frame)
+        score = sharpness_score(frame[y1:y2, x1:x2])
+        self.frame_buffer.append((score, frame))
+        self.frame_count += 1
+        if self.frame_count % 5 == 0:
+            avg = sum(s for s, _ in self.frame_buffer) / len(self.frame_buffer)
+            self.sharp_var.set(f"Focus check: {sharpness_label(avg)} ({avg:.0f})")
 
     def on_filter_change(self, event=None):
         self.refresh_table()
@@ -685,7 +898,10 @@ class ScannerApp:
             messagebox.showinfo(APP_NAME, "The camera isn't working yet, so there's "
                                 "nothing to snap. Check the camera number.")
             return
-        frame = self.last_frame.copy()
+        if self.frame_buffer:  # use the sharpest of the last few frames
+            frame = max(self.frame_buffer, key=lambda t: t[0])[1].copy()
+        else:
+            frame = self.last_frame.copy()
         x1, y1, x2, y2 = card_box(frame)
         crop = frame[y1:y2, x1:x2].copy()
 
