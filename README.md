@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/34991011/README.md)
+[README (1).md](https://github.com/user-attachments/files/34993628/README.1.md)
 # MTG Card Scanner
 
 A Windows desktop app that identifies Magic: The Gathering cards from a webcam or a phone
@@ -51,6 +51,30 @@ need to uninstall first.
 4. Pick the right guess, pick the printing (the set the card is from), choose foil or
    non-foil, set the quantity, and click **Add card**.
 
+### Card type: Standard, Land or Token
+Under **Capture** there is a **Card type** switch (key **M** cycles it).
+
+- **Standard** - normal cards. Read by name, then artwork.
+- **Land** - for *basic* lands (Plains, Island, Swamp, Mountain, Forest, and the snow-covered
+  ones). They all share one name across hundreds of printings, so the app works out which
+  basic it is (by the name and by the colour of the big mana symbol), then picks the printing
+  by artwork and by the set code + number at the bottom-left. Lands that have their own name
+  (Tranquil Cove, Command Tower, ...) don't need this mode; if the scanner sees one in Land
+  mode it quietly reads it as a Standard card.
+- **Token** - for tokens (Angel, Soldier, Treasure, ...). Many tokens share a name but have
+  different art, power/toughness and rules text, so this mode also reads the line under the art
+  (for example *Token Creature - Angel*), the rules text (*Flying*) and the power/toughness,
+  and compares them, plus the artwork, with every printing of that token.
+
+### The set code and number
+On cards from about 2015 onward the bottom-left corner has a collector number and a set code
+(for example `0275` over `MOM`). The app reads it last, because the print is tiny and a webcam
+blurs it. It only ever *adds* to the evidence: a matching number nudges that card up the list
+(more strongly for lands and tokens), and when it matches, the app says so and selects that
+printing for you. A number that doesn't fit the name, artwork or text never overrides them.
+If it can't be read, nothing is lost. Turn it off in **Settings > General** if it slows you down.
+For big batches, you can also type `MOM 275` into the name box.
+
 ### Auto mode
 Switch **Capture** from *Manual* to *Auto*. When the card is sharp and held still for about a
 second, the app snaps it for you and opens the same confirm window, so nothing is added
@@ -89,7 +113,7 @@ Click **Settings** (or press **Ctrl+comma**).
 - **Scanning:** how long Auto waits, and how sharp the picture must be before it counts as
   ready. The small `focus` number under the camera shows what your camera reaches.
 - **Keys:** every action can have its own key. Defaults: Space snap, A switch Manual/Auto,
-  T switch Non-foil/Foil for new scans, P phone, O photo file, N add by name or number,
+  T switch Non-foil/Foil for new scans, M switch Standard/Land/Token, P phone, O photo file, N add by name or number,
   + and - change quantity, F switch foil, Delete remove, Ctrl+E export view, Ctrl+Q exit.
   Single-letter keys are ignored while you are typing in a box.
 
@@ -114,7 +138,12 @@ Click **Exit** in the top right, press **Ctrl+Q**, or close the window.
    `art` scores.
 5. **Choosing the printing.** The same artwork comparison suggests which printing you hold.
    Prices come from that printing, foil or non-foil.
-6. **You confirm.** Nothing is added until you click **Add card**.
+6. **The small print (last).** The bottom-left set code is checked against Scryfall's list of
+   real sets and the number is looked up. A match picks the printing; it is never allowed to
+   outvote a clear name and artwork.
+7. **Lands and tokens.** In Land and Token modes the steps above are replaced by the matching
+   described under *Card type*, because the name alone can't tell those cards apart.
+8. **You confirm.** Nothing is added until you click **Add card** (Ctrl+Enter also works).
 
 ### How the phone link works
 The PC runs a small web page that only your local network can reach. The QR code contains its
@@ -162,6 +191,13 @@ source.
   printing, the value will be wrong. Compare the set and number with your card.
 - Foil and special treatments (etched, borderless, showcase) are not detected from the photo.
   Choose foil or non-foil yourself.
+
+- **Land and Token modes are newer and less proven.** The colour check looks at the big mana
+  symbol and can be fooled by glare, sleeves or odd frames. Always check the set and number
+  shown against the card. Very old cards (before about 2015) have no readable set code in the
+  corner, and the corner is small enough that a blurry camera may not read it; phone scanning
+  helps. Double-faced, borderless or full-art lands put things in different places, so expect to
+  pick the printing by hand more often.
 
 **Prices**
 - Prices come from Scryfall's data (market estimates, mainly US dollars) and can be out of date
@@ -232,6 +268,7 @@ source.
 | --- | --- |
 | *No camera found* | Close other apps using the camera, try another camera number under **Camera**, or use Phone / Photo file |
 | Status keeps saying *Blurry* | Add light, hold the card steadier, move it a bit further away, or lower the sharpness setting in **Settings > Scanning** |
+| Lands or tokens keep coming out wrong | Pick **Land** or **Token** under **Card type** first. Check the printing list and use the set code and number boxes if needed |
 | Wrong guesses | Use the best light you can, fill the frame, hold the card flat, and use your phone for scanning |
 | No artwork thumbnails | Scryfall asked us to slow down; wait 30 seconds and scan again |
 | Phone can't connect | Same Wi-Fi? Not a guest network? Firewall prompt allowed? Try opening the address shown in the phone window |
@@ -241,7 +278,7 @@ source.
 
 If something odd happens, turn on **Camera > Save diagnostic pictures**, scan the card, and look
 in `Documents/MTG Card Scanner/Debug/`. Each scan saves its photos and a `result.txt` listing
-what was read and each guess's name and artwork scores.
+what was read and each guess's name and artwork scores, plus the small print it saw at the bottom-left and crops of the areas it read (`crop_collector.jpg`, `crop_type.jpg`, ...). Sending those to the developer is the fastest way to improve the reading.
 
 ---
 
