@@ -1,4 +1,4 @@
-[README (2).md](https://github.com/user-attachments/files/34994343/README.2.md)
+[README (3).md](https://github.com/user-attachments/files/34996040/README.3.md)
 # MTG Card Scanner
 
 A Windows desktop app that identifies Magic: The Gathering cards from a webcam or a phone
@@ -97,6 +97,18 @@ Click **Add by name / number...** and type part of a name (suggestions appear as
 or type a set code and collector number such as `TLA 58`. The set code and number are printed
 at the bottom-left of most cards.
 
+### Decks (keeping separate lists)
+Above the list is a **Deck** box. Each deck is its own list of cards, so you can keep one for
+each set, binder, box or trade stack.
+
+- **New deck** asks for a name and starts an empty deck (Ctrl+N).
+- Pick another deck in the box, or press **D** to go to the next one.
+- **Rename** changes the name; **Delete** moves the deck to `Decks/Deleted/` (you can drag it
+  back) and can't remove your last deck.
+- New scans go into the deck you are showing. Totals, filters, sorting and exports all apply
+  to that deck, and exported files are named after it.
+- You can't switch decks while the confirm window is open.
+
 ### Your list
 - **Qty** shows how many copies you have. Use **+1** and **-1** on the selected rows.
 - **Switch foil** flips the selected cards between foil and non-foil prices.
@@ -104,7 +116,26 @@ at the bottom-left of most cards.
 - **Type**, **Color** and **Sort** change what is shown. The tiles at the top show the card
   count and the value of the current view and of the whole collection.
 - **Export view** saves what you are looking at; **Export all** saves everything. **My files**
-  opens your data folder.
+  opens your data folder. These two make a readable report with prices, for you.
+
+### Export for other websites
+**Export for websites...** (under the list) makes a file that other Magic sites can import:
+
+- **Text list** - one card per line, like `2 Lightning Bolt (M20) 152` and, for foils,
+  `1 Plains (M20) 262 *F*`. Paste it into the import box of sites such as Moxfield, Archidekt
+  or Manabox. The set code and number tell the site the exact printing, which matters most for
+  basic lands and tokens.
+- **CSV file** - columns `Count, Name, Edition, Set Code, Card Number, Foil, Scryfall ID`, for
+  sites that import a collection from a spreadsheet (Deckbox, Archidekt, Manabox ...). If a
+  site complains about a column, open the file in a spreadsheet and delete that column, or
+  match the columns up in the site's import screen.
+
+Choose the whole deck or only what is shown. Cards added by hand with a custom value, or saved
+before the set code was kept, may have no set code; the app tells you how many, and the site
+will choose a printing for those.
+
+Import rules change and differ from site to site, and this app has not been tested against
+each one. Check the preview a site shows before you confirm an import.
 
 ### Settings and key binds
 Click **Settings** (or press **Ctrl+comma**).
@@ -113,7 +144,7 @@ Click **Settings** (or press **Ctrl+comma**).
 - **Scanning:** how long Auto waits, and how sharp the picture must be before it counts as
   ready. The small `focus` number under the camera shows what your camera reaches.
 - **Keys:** every action can have its own key. Defaults: Space snap, A switch Manual/Auto,
-  T switch Non-foil/Foil for new scans, M switch Standard/Land/Token, P phone, O photo file, N add by name or number,
+  Ctrl+N new deck, D next deck, T switch Non-foil/Foil for new scans, M switch Standard/Land/Token, P phone, O photo file, N add by name or number,
   + and - change quantity, F switch foil, Delete remove, Ctrl+E export view, Ctrl+Q exit.
   Single-letter keys are ignored while you are typing in a box.
 
@@ -171,7 +202,9 @@ source.
 
 | Item | What it is |
 | --- | --- |
-| `cards.json` | Your collection |
+| `Decks/` | One file per deck (`Deck name.json`). Back these up to keep your lists safe |
+| `Decks/Deleted/` | Decks you deleted, kept until you remove them |
+| `cards.json` | Your list from before decks existed. It became the deck *My Collection* and is left alone as a backup |
 | `settings.json` | Your settings and key binds |
 | `Scans/` | A photo of every card you scanned |
 | `Exports/` | Default place for exported text files |
