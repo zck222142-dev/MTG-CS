@@ -30,6 +30,7 @@ Developers can run it from source:
 
 import datetime
 import difflib
+import hashlib
 import heapq
 import io
 import json
@@ -40,6 +41,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -109,8 +111,33 @@ RESOLUTIONS = [("1280 x 720", 1280, 720),
 CARD_W, CARD_H = 630, 880            # size of a straightened card image
 CARD_RATIO = 63 / 88                 # width / height of a real card
 BOX_HEIGHT_FRACTION = 0.92           # size of the guide frame
-AUTO_HOLD_FRAMES = 15                # auto mode: frames the card must stay ready and still
-HEADERS = {"User-Agent": "MTGCardScannerApp/1.2", "Accept": "application/json"}
+
+# Version. The installer build (GitHub Actions) writes build_info.txt next to the app with
+# the full version (for example 1.3.27) and the name of your GitHub repository, so the
+# app knows what it is and where to look for updates. Running from source: version x.y.0.
+APP_BASE_VERSION = "1.3"
+
+
+def app_dir():
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
+def read_build_info():
+    info = {}
+    try:
+        for line in (app_dir() / "build_info.txt").read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                info[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return info
+
+
+BUILD_INFO = read_build_info()
+APP_VERSION = BUILD_INFO.get("version") or f"{APP_BASE_VERSION}.0"
+IS_BUILT = bool(getattr(sys, "frozen", False))
+HEADERS = {"User-Agent": f"MTGCardScannerApp/{APP_VERSION}", "Accept": "application/json"}
 API = "https://api.scryfall.com"
 
 
@@ -310,6 +337,13 @@ def apply_theme(root):
     s.map("Vertical.TScrollbar", background=[("active", C["line"])])
     s.configure("Horizontal.TScale", background=C["panel"], troughcolor=C["panel2"],
                 lightcolor=C["panel2"], darkcolor=C["panel2"])
+    s.configure("TNotebook", background=C["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+    s.configure("TNotebook.Tab", background=C["panel2"], foreground=C["muted"],
+                padding=(18, 9), borderwidth=0)
+    s.map("TNotebook.Tab", background=[("selected", C["accent"]), ("active", C["hover"])],
+          foreground=[("selected", "#ffffff"), ("active", C["text"])])
+    s.configure("Horizontal.TProgressbar", troughcolor=C["panel2"], background=C["accent"],
+                bordercolor=C["panel"], lightcolor=C["accent"], darkcolor=C["accent"])
 
 
 # ------------------------------------------------------------ price lookups
@@ -515,6 +549,157 @@ def fetch_small(url):
         _IMG_CACHE.clear()
     _IMG_CACHE[url] = img
     return img
+
+
+# ------------------------------------------------------------------ updates
+RELEASE_ASSET_SUFFIX = "-Setup.exe"
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+
+
+class UpdateError(Exception):
+    """A problem checking for or installing an update, in words a person can read."""
+
+
+def parse_version(text):
+    return tuple(int(x) for x in re.findall(r"\d+", text or ""))
+
+
+def find_update(repo, current):
+    """Ask GitHub for the newest release of `repo`. Returns None when `current` is
+    up to date, otherwise {"version", "url", "size", "sha256", "notes"}."""
+    if not REPO_RE.match(repo or ""):
+        raise UpdateError("This copy doesn't know where to look for updates. Open Settings "
+                          "and type your GitHub address (like yourname/your-repo).")
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}/releases/latest",
+                         headers={"User-Agent": HEADERS["User-Agent"],
+                                  "Accept": "application/vnd.github+json"}, timeout=12)
+    except requests.RequestException:
+        raise UpdateError("Couldn't reach GitHub - check your internet connection.") from None
+    if r.status_code == 404:
+        raise UpdateError("No release found. The GitHub repository must be public, and its "
+                          "build must have finished successfully.")
+    if r.status_code in (403, 429):
+        raise UpdateError("GitHub asked us to try again later. Wait a few minutes.")
+    if r.status_code != 200:
+        raise UpdateError(f"GitHub answered with an error ({r.status_code}).")
+    data = r.json()
+    latest = str(data.get("tag_name", "")).lstrip("vV")
+    if not parse_version(latest) or parse_version(latest) <= parse_version(current):
+        return None
+    prefix = f"https://github.com/{repo}/releases/download/"
+    for a in data.get("assets", []):
+        url = str(a.get("browser_download_url", ""))
+        if str(a.get("name", "")).endswith(RELEASE_ASSET_SUFFIX) and url.startswith(prefix):
+            digest = str(a.get("digest") or "")
+            return {"version": latest, "url": url, "size": int(a.get("size") or 0),
+                    "sha256": digest.split(":", 1)[1].lower() if digest.startswith("sha256:") else "",
+                    "notes": str(data.get("body") or "").strip()[:700]}
+    raise UpdateError("The newest release has no installer attached yet. Try again in a few minutes.")
+
+
+def download_update(info, progress=None):
+    """Download the installer and check it is complete (and matches its checksum when
+    GitHub provides one). Returns the file's path."""
+    dest = Path(tempfile.mkdtemp(prefix="mtg_update_")) / "MTG-Card-Scanner-Setup.exe"
+    digest, got = hashlib.sha256(), 0
+    try:
+        with requests.get(info["url"], headers={"User-Agent": HEADERS["User-Agent"]},
+                          stream=True, timeout=30) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length") or info.get("size") or 0)
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(65536):
+                    f.write(chunk)
+                    digest.update(chunk)
+                    got += len(chunk)
+                    if progress and total:
+                        progress(min(1.0, got / total))
+    except requests.RequestException:
+        raise UpdateError("The download was interrupted. Check your connection and try again.") from None
+    if info.get("size") and got != info["size"]:
+        raise UpdateError("The download was incomplete, so it was not installed.")
+    if info.get("sha256") and digest.hexdigest() != info["sha256"]:
+        raise UpdateError("The download didn't match its checksum, so it was not installed.")
+    with open(dest, "rb") as f:
+        if f.read(2) != b"MZ":
+            raise UpdateError("The downloaded file isn't a Windows installer, so it was not run.")
+    return dest
+
+
+def launch_installer(path):
+    """Start the installer (it closes this app, upgrades it in place, and reopens it)."""
+    subprocess.Popen([str(path), "/SILENT", "/CLOSEAPPLICATIONS", "/NORESTART",
+                      "/SUPPRESSMSGBOXES"], close_fds=True)
+
+
+# ---------------------------------------------------------------- key binds
+# (id, what it does, default key). Keys are stored as Tk key names, e.g. "space",
+# "Control-e", "F5". An empty string means "not assigned".
+ACTIONS = [
+    ("snap", "Snap a card with the camera", "space"),
+    ("auto", "Switch Manual / Auto capture", "a"),
+    ("finish", "Switch new scans Non-foil / Foil", "t"),
+    ("phone", "Open the phone link", "p"),
+    ("photo", "Add from a photo file", "o"),
+    ("add_name", "Add by name or number", "n"),
+    ("qty_up", "+1 on the selected cards", "plus"),
+    ("qty_down", "-1 on the selected cards", "minus"),
+    ("flip", "Switch the selected cards foil / non-foil", "f"),
+    ("remove", "Remove the selected cards", "Delete"),
+    ("export_view", "Export the current view", "Control-e"),
+    ("export_all", "Export all cards", ""),
+    ("settings", "Open Settings", "Control-comma"),
+    ("update", "Check for updates", ""),
+    ("exit", "Exit the app", "Control-q"),
+]
+DEFAULT_KEYS = {a: k for a, _, k in ACTIONS}
+ACTION_LABELS = {a: label for a, label, _ in ACTIONS}
+_MODIFIER_KEYS = {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L",
+                  "Meta_R", "Caps_Lock", "Num_Lock", "Super_L", "Super_R", "ISO_Level3_Shift"}
+_RESERVED_KEYS = {"Tab", "Return", "Escape", "Up", "Down", "Left", "Right", "Prior", "Next",
+                  "Home", "End"}
+_KEY_NAMES = {"space": "Space", "plus": "+", "minus": "-", "equal": "=", "comma": ",",
+              "period": ".", "Delete": "Delete", "BackSpace": "Backspace", "Insert": "Insert"}
+
+
+def format_key(key):
+    if not key:
+        return "(none)"
+    *mods, sym = key.split("-")
+    name = _KEY_NAMES.get(sym, sym.upper() if len(sym) == 1 else sym)
+    return "+".join([("Ctrl" if m == "Control" else m) for m in mods] + [name])
+
+
+def key_has_modifier(key):
+    *mods, sym = key.split("-")
+    return bool(mods) or (sym[:1] == "F" and sym[1:].isdigit())
+
+
+def key_patterns(key):
+    """The Tk binding strings for a stored key (letters work with Caps Lock too, and
+    the plus / minus keys also answer to = and the number pad)."""
+    *mods, sym = key.split("-")
+    syms = [sym.lower(), sym.upper()] if len(sym) == 1 and sym.isalpha() else [sym]
+    syms += {"plus": ["equal", "KP_Add"], "minus": ["KP_Subtract"]}.get(sym, [])
+    return ["<" + "-".join(mods + ["Key", x]) + ">" for x in syms]
+
+
+def event_to_key(event):
+    """A key press -> stored key text, or None for a bare modifier / unusable key."""
+    sym = event.keysym
+    if sym in _MODIFIER_KEYS:
+        return None
+    mods = []
+    if event.state & 0x4:
+        mods.append("Control")
+    if event.state & (0x20000 if os.name == "nt" else 0x8):
+        mods.append("Alt")
+    if len(sym) == 1 and sym.isalpha():
+        sym = sym.lower()
+    if sym in _RESERVED_KEYS and not mods:
+        return "reserved"
+    return "-".join(mods + [sym])
 
 
 # --------------------------------------------------------------- card names
@@ -2075,6 +2260,283 @@ class PhoneWindow(tk.Toplevel):
         self.destroy()
 
 
+# ------------------------------------------------------------ settings window
+def _num(value, default, lo, hi):
+    try:
+        return max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+class SettingsWindow(tk.Toplevel):
+    """General options, scanning sensitivity and key binds. Changes apply at once."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.configure(bg=C["bg"])
+        self.title("Settings")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.hold_var = tk.DoubleVar(value=app.auto_hold_s)
+        self.blur_var = tk.DoubleVar(value=app.blur_min)
+        self.upd_var = tk.BooleanVar(value=app.check_updates)
+        self.repo_var = tk.StringVar(value=app.settings.get("update_repo", ""))
+        self.hold_text = tk.StringVar()
+        self.blur_text = tk.StringVar()
+        self.key_vars = {}
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill="both", expand=True)
+        nb = ttk.Notebook(outer)
+        nb.pack(fill="both", expand=True)
+        for title, build in (("General", self._general), ("Scanning", self._scanning),
+                             ("Keys", self._keys)):
+            page = ttk.Frame(nb, style="Panel.TFrame", padding=18)
+            nb.add(page, text=title)
+            build(page)
+        ttk.Button(outer, text="Done", style="Accent.TButton", command=self.close).pack(
+            anchor="e", pady=(14, 0))
+        self.bind("<Escape>", lambda e: self.close())
+        center_on(self, parent)
+
+    def close(self):
+        self._save_repo()
+        self.app.settings_window = None
+        self.destroy()
+
+    # ---- tabs
+    def _general(self, f):
+        ttk.Label(f, text=f"MTG Card Scanner   version {APP_VERSION}",
+                  style="Panel.TLabel", font=F(11, "bold")).pack(anchor="w")
+        ttk.Label(f, style="PanelMuted.TLabel", justify="left", wraplength=460, text=(
+            "Your cards, settings and scan photos are saved in your Documents folder and are "
+            "kept when the app updates.")).pack(anchor="w", pady=(4, 14))
+        ttk.Checkbutton(f, text="Look for updates when the app starts", variable=self.upd_var,
+                        command=lambda: self.app.set_option("check_updates", bool(self.upd_var.get()))
+                        ).pack(anchor="w")
+        ttk.Label(f, text="Update source on GitHub (owner/name)", style="PanelMuted.TLabel").pack(
+            anchor="w", pady=(14, 2))
+        e = ttk.Entry(f, textvariable=self.repo_var, width=40)
+        e.pack(anchor="w")
+        e.bind("<FocusOut>", lambda ev: self._save_repo())
+        e.bind("<Return>", lambda ev: self._save_repo())
+        built = BUILD_INFO.get("repo", "")
+        ttk.Label(f, style="PanelMuted.TLabel", wraplength=460, justify="left", text=(
+            f"Leave blank to use the one built into this app ({built or 'none'}). The repository "
+            "has to be public.")).pack(anchor="w", pady=(2, 14))
+        row = ttk.Frame(f, style="Panel.TFrame")
+        row.pack(anchor="w")
+        ttk.Button(row, text="Check for updates now", command=self._check).pack(side="left")
+        ttk.Button(row, text="Read me", command=self.app.open_readme).pack(side="left", padx=8)
+        ttk.Button(row, text="My files", command=lambda: open_folder(DATA_DIR)).pack(side="left")
+
+    def _check(self):
+        self._save_repo()
+        self.app.start_update_check(manual=True)
+
+    def _save_repo(self):
+        value = self.repo_var.get().strip()
+        if value != self.app.settings.get("update_repo", ""):
+            self.app.set_option("update_repo", value)
+
+    def _scanning(self, f):
+        ttk.Label(f, text="Auto mode: how long a card must be held still", style="Panel.TLabel").pack(anchor="w")
+        row = ttk.Frame(f, style="Panel.TFrame")
+        row.pack(fill="x", pady=(4, 2))
+        sc = ttk.Scale(row, from_=0.5, to=3.0, variable=self.hold_var, orient="horizontal",
+                       length=260, command=lambda v: self._show())
+        sc.pack(side="left")
+        sc.bind("<ButtonRelease-1>", lambda e: self.app.set_option("auto_hold", round(self.hold_var.get(), 1)))
+        ttk.Label(row, textvariable=self.hold_text, style="Panel.TLabel", width=12).pack(side="left", padx=10)
+        ttk.Label(f, style="PanelMuted.TLabel", wraplength=460, justify="left", text=(
+            "Shorter is faster but may grab a card while it is still moving.")).pack(anchor="w", pady=(0, 16))
+        ttk.Label(f, text="How sharp the picture must be before it counts as ready",
+                  style="Panel.TLabel").pack(anchor="w")
+        row = ttk.Frame(f, style="Panel.TFrame")
+        row.pack(fill="x", pady=(4, 2))
+        sc = ttk.Scale(row, from_=20, to=90, variable=self.blur_var, orient="horizontal",
+                       length=260, command=lambda v: self._show())
+        sc.pack(side="left")
+        sc.bind("<ButtonRelease-1>", lambda e: self.app.set_option("blur_min", round(self.blur_var.get())))
+        ttk.Label(row, textvariable=self.blur_text, style="Panel.TLabel", width=12).pack(side="left", padx=10)
+        ttk.Label(f, style="PanelMuted.TLabel", wraplength=460, justify="left", text=(
+            "The small 'focus' number under the camera shows what your camera reaches with a "
+            "card held steady. If the status keeps saying Blurry when it looks fine, lower this. "
+            "If blurry cards slip through, raise it.")).pack(anchor="w", pady=(0, 16))
+        ttk.Button(f, text="Reset these two", command=self._reset_scan).pack(anchor="w")
+        self._show()
+
+    def _show(self):
+        self.hold_text.set(f"{self.hold_var.get():.1f} seconds")
+        self.blur_text.set(f"{int(round(self.blur_var.get()))}")
+
+    def _reset_scan(self):
+        self.hold_var.set(1.0)
+        self.blur_var.set(45)
+        self.app.set_option("auto_hold", 1.0)
+        self.app.set_option("blur_min", 45)
+        self._show()
+
+    def _keys(self, f):
+        ttk.Label(f, style="PanelMuted.TLabel", wraplength=500, justify="left", text=(
+            "Click Change, then press the key (or a combination like Ctrl+E). Single keys are "
+            "ignored while you are typing in a box.")).pack(anchor="w", pady=(0, 10))
+        grid = ttk.Frame(f, style="Panel.TFrame")
+        grid.pack(anchor="w")
+        for r, (aid, label, _) in enumerate(ACTIONS):
+            ttk.Label(grid, text=label, style="Panel.TLabel", width=40).grid(row=r, column=0, sticky="w", pady=2)
+            var = tk.StringVar()
+            self.key_vars[aid] = var
+            ttk.Label(grid, textvariable=var, style="Panel.TLabel", width=12, anchor="center").grid(row=r, column=1, padx=6)
+            ttk.Button(grid, text="Change", style="Small.TButton",
+                       command=lambda a=aid: self._capture(a)).grid(row=r, column=2, padx=2)
+            ttk.Button(grid, text="Clear", style="Small.TButton",
+                       command=lambda a=aid: self._clear(a)).grid(row=r, column=3, padx=2)
+        ttk.Button(f, text="Reset all keys", command=self._reset_keys).pack(anchor="w", pady=(12, 0))
+        self._refresh_keys()
+
+    def _refresh_keys(self):
+        keys = self.app.current_keys()
+        for aid, var in self.key_vars.items():
+            var.set(format_key(keys.get(aid, "")))
+
+    def _clear(self, aid):
+        self.app.set_key(aid, "")
+        self._refresh_keys()
+
+    def _reset_keys(self):
+        self.app.reset_keys()
+        self._refresh_keys()
+
+    def _capture(self, aid):
+        win = tk.Toplevel(self)
+        win.configure(bg=C["bg"])
+        win.title("Set key")
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text=f"Press the key for:\n{ACTION_LABELS[aid]}\n\n(Esc cancels)",
+                  justify="center", padding=24).pack()
+        info = tk.StringVar()
+        ttk.Label(win, textvariable=info, style="Muted.TLabel", wraplength=280).pack(pady=(0, 14))
+
+        def on_key(e):
+            if e.keysym == "Escape":
+                win.destroy()
+                return "break"
+            key = event_to_key(e)
+            if key is None:
+                return "break"
+            if key == "reserved":
+                info.set("That key is used to move around the lists. Pick another.")
+                return "break"
+            other = next((a for a, k in self.app.current_keys().items() if k == key and a != aid), None)
+            if other and not messagebox.askyesno(
+                    APP_NAME, f'{format_key(key)} is already used for "{ACTION_LABELS[other]}". '
+                              "Use it here instead?", parent=win):
+                return "break"
+            if other:
+                self.app.set_key(other, "")
+            self.app.set_key(aid, key)
+            win.destroy()
+            self._refresh_keys()
+            return "break"
+
+        win.bind("<Key>", on_key)
+        center_on(win, self)
+        try:
+            win.wait_visibility()
+            win.grab_set()
+        except tk.TclError:
+            pass
+        win.focus_force()
+
+
+class UpdateDialog(tk.Toplevel):
+    """Offers a new version, downloads it with a progress bar, and starts the installer."""
+
+    def __init__(self, parent, app, info):
+        super().__init__(parent)
+        self.app, self.info = app, info
+        self.configure(bg=C["bg"])
+        self.title("Update available")
+        self.transient(parent)
+        self.resizable(False, False)
+        self._q = queue.Queue()
+        body = ttk.Frame(self, padding=20)
+        body.pack()
+        ttk.Label(body, text=f"Version {info['version']} is ready", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(body, style="Muted.TLabel", text=f"You have version {APP_VERSION}.").pack(anchor="w", pady=(2, 10))
+        if info.get("notes"):
+            ttk.Label(body, text=info["notes"], style="Muted.TLabel", wraplength=420,
+                      justify="left").pack(anchor="w", pady=(0, 10))
+        ttk.Label(body, style="PanelMuted.TLabel", wraplength=420, justify="left", text=(
+            "The app will close, update itself and reopen. Your cards and settings are kept.")
+                  ).pack(anchor="w", pady=(0, 10))
+        self.bar = ttk.Progressbar(body, length=420, maximum=1.0)
+        self.status = tk.StringVar()
+        ttk.Label(body, textvariable=self.status, style="Muted.TLabel").pack(anchor="w")
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(12, 0))
+        self.go = ttk.Button(row, text="Update now", style="Accent.TButton", command=self.start)
+        self.go.pack(side="right")
+        self.later = ttk.Button(row, text="Later", command=self.destroy)
+        self.later.pack(side="right", padx=(0, 8))
+        self._body = body
+        center_on(self, parent)
+
+    def start(self):
+        self.go.state(["disabled"])
+        self.later.state(["disabled"])
+        self.bar.pack(fill="x", pady=(4, 4), before=self._body.winfo_children()[-1])
+        self.status.set("Downloading...")
+        info, q = self.info, self._q
+
+        def work():
+            try:
+                path = download_update(info, lambda f: q.put(("progress", f)))
+                q.put(("done", path))
+            except UpdateError as e:
+                q.put(("error", str(e)))
+            except Exception as e:  # noqa: BLE001
+                q.put(("error", f"The update failed ({type(e).__name__})."))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll)
+
+    def _poll(self):
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        while True:
+            try:
+                kind, val = self._q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                self.bar["value"] = val
+                self.status.set(f"Downloading...  {int(val * 100)}%")
+            elif kind == "error":
+                self.status.set(val)
+                self.go.state(["!disabled"])
+                self.later.state(["!disabled"])
+                return
+            elif kind == "done":
+                self.status.set("Starting the installer...")
+                try:
+                    launch_installer(val)
+                except OSError as e:
+                    self.status.set(f"Couldn't start the installer: {e}")
+                    self.later.state(["!disabled"])
+                    return
+                self.app.root.after(300, self.app.on_close)
+                return
+        self.after(100, self._poll)
+
+
 # ---------------------------------------------------------------- main app
 class ScannerApp:
     def __init__(self, root):
@@ -2090,6 +2552,21 @@ class ScannerApp:
         apply_theme(root)
         start_ocr_warmup()                 # everything slow loads in the background
         self.settings = load_json(SETTINGS_FILE, {})
+        if not isinstance(self.settings, dict):
+            self.settings = {}
+        saved_keys = self.settings.get("keys", {})
+        self.keys = dict(DEFAULT_KEYS)
+        if isinstance(saved_keys, dict):
+            self.keys.update({a: k for a, k in saved_keys.items()
+                              if a in DEFAULT_KEYS and isinstance(k, str)})
+        self.auto_hold_s = _num(self.settings.get("auto_hold", 1.0), 1.0, 0.5, 3.0)
+        self.blur_min = _num(self.settings.get("blur_min", 45), 45.0, 20.0, 90.0)
+        self.check_updates = bool(self.settings.get("check_updates", True))
+        self.pending_update = None
+        self.update_btn = None
+        self.settings_window = None
+        self._bound = []
+        self._bgq = queue.Queue()
         self.cards = load_cards()
         self.catalog = NameCatalog(NAMES_FILE)
         self.catalog.start()
@@ -2120,7 +2597,7 @@ class ScannerApp:
         self._pill_state = None
         self._seen_seq = -1
         self._opened_cam_settings = False
-        self.auto_hold = 0                    # auto mode bookkeeping
+        self.auto_t0 = None                   # auto mode: when the card became ready and still
         self.auto_armed = True
         self.auto_gone = 0
         self.phone = None
@@ -2130,9 +2607,12 @@ class ScannerApp:
         self.start_camera()
         self.refresh_table()
         self.update_preview()
-        root.bind("<space>", self.on_space)
+        self.apply_keybinds()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.canvas.focus_set()
+        root.after(300, self.poll_bg)
+        if IS_BUILT and self.check_updates:        # quietly, a few seconds after start-up
+            root.after(4000, lambda: self.start_update_check(False))
 
     # ---------------------------------------------------------------- UI
     def build_ui(self):
@@ -2148,7 +2628,7 @@ class ScannerApp:
         titles = ttk.Frame(head)
         titles.grid(row=0, column=0, sticky="w")
         ttk.Label(titles, text="MTG Card Scanner", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(titles, text="Scan, price and sort your Magic cards",
+        ttk.Label(titles, text=f"Scan, price and sort your Magic cards   -   version {APP_VERSION}",
                   style="Muted.TLabel").pack(anchor="w")
         tiles = ttk.Frame(head)
         tiles.grid(row=0, column=1, sticky="e")
@@ -2157,6 +2637,15 @@ class ScannerApp:
         t3, self.tile_all = stat_tile(tiles, "Whole collection")
         for t in (t1, t2, t3):
             t.pack(side="left", padx=(8, 0))
+        hb = ttk.Frame(head)
+        hb.grid(row=0, column=2, sticky="e", padx=(16, 0))
+        ttk.Button(hb, text="Settings", style="Small.TButton", command=self.open_settings,
+                   takefocus=0).pack(side="left", padx=(0, 6))
+        self.update_btn = ttk.Button(hb, text="Check for updates", style="Small.TButton",
+                                     command=self.on_update_click, takefocus=0)
+        self.update_btn.pack(side="left", padx=(0, 6))
+        ttk.Button(hb, text="Exit", style="Danger.TButton", command=self.on_close,
+                   takefocus=0).pack(side="left")
 
         # ---- left: camera
         left = ttk.Frame(root, padding=(22, 8, 10, 12))
@@ -2403,7 +2892,7 @@ class ScannerApp:
             return "warn", "Move the card closer"
         if bright < 55:
             return "warn", "Too dark - add more light"
-        if self.sharp_avg < 45:
+        if self.sharp_avg < self.blur_min:
             return "warn", "Blurry - hold steady or adjust focus"
         return "good", "Ready - press Space"
 
@@ -2411,7 +2900,7 @@ class ScannerApp:
         """Auto mode: when the card is ready AND still for a moment, capture it.
         The confirm window still opens, so nothing is added without your OK."""
         if self.quad is None:
-            self.auto_hold = 0
+            self.auto_t0 = None
             self.auto_gone += 1
             if self.auto_gone >= 8:
                 self.auto_armed = True
@@ -2420,18 +2909,21 @@ class ScannerApp:
         if not self.auto_armed:
             return "idle", "Remove the card to scan the next one (or press Space)"
         if state != "good":
-            self.auto_hold = 0
+            self.auto_t0 = None
             return state, text
         if self.quad_motion > max(6.0, frame.shape[1] * 0.006):
-            self.auto_hold = 0
+            self.auto_t0 = None
             return "warn", "Hold still..."
-        self.auto_hold += 1
-        if self.auto_hold >= AUTO_HOLD_FRAMES:
-            self.auto_hold = 0
+        now = time.time()
+        if self.auto_t0 is None:
+            self.auto_t0 = now
+        progress = (now - self.auto_t0) / max(0.2, self.auto_hold_s)
+        if progress >= 1.0:
+            self.auto_t0 = None
             self.auto_armed = False                 # one scan per card placement
             self.root.after(10, self.snap)
             return "good", "Captured!"
-        return "good", f"Hold still...  {int(100 * self.auto_hold / AUTO_HOLD_FRAMES)}%"
+        return "good", f"Hold still...  {int(100 * progress)}%"
 
     def set_pill(self, state, text):
         if (state, text) == self._pill_state:
@@ -2458,20 +2950,170 @@ class ScannerApp:
             cv2.line(img, (cx, cy), (cx, cy + dy * n), color, 3, cv2.LINE_AA)
 
     # ---------------------------------------------------------- handlers
-    def on_space(self, event):
-        try:
-            w = self.root.focus_get()
-        except (KeyError, tk.TclError):
-            return
-        if isinstance(w, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox)):
-            return
-        self.snap()
+    # ------------------------------------------------------------ key binds
+    def current_keys(self):
+        return dict(self.keys)
+
+    def set_key(self, action, key):
+        self.keys[action] = key
+        self._save_keys()
+
+    def reset_keys(self):
+        self.keys = dict(DEFAULT_KEYS)
+        self._save_keys()
+
+    def _save_keys(self):
+        self.settings["keys"] = {a: k for a, k in self.keys.items() if k != DEFAULT_KEYS[a]}
+        save_json(SETTINGS_FILE, self.settings)
+        self.apply_keybinds()
+
+    def key_actions(self):
+        return {"snap": self.snap, "auto": self.toggle_mode, "finish": self.toggle_finish,
+                "phone": self.open_phone, "photo": self.scan_file, "add_name": self.add_by_name,
+                "qty_up": lambda: self.change_qty(1), "qty_down": lambda: self.change_qty(-1),
+                "flip": self.flip_selected, "remove": self.remove_selected,
+                "export_view": self.export_view, "export_all": self.export_all,
+                "settings": self.open_settings,
+                "update": lambda: self.start_update_check(True), "exit": self.on_close}
+
+    def apply_keybinds(self):
+        for seq in self._bound:
+            try:
+                self.root.unbind(seq)
+            except tk.TclError:
+                pass
+        self._bound = []
+        for action, key in self.keys.items():
+            if not key:
+                continue
+            for seq in key_patterns(key):
+                try:
+                    self.root.bind(seq, lambda e, a=action, k=key: self.on_key_action(a, k))
+                    self._bound.append(seq)
+                except tk.TclError:
+                    pass
+
+    def on_key_action(self, action, key):
+        if not key_has_modifier(key):         # plain keys must not steal typing
+            try:
+                w = self.root.focus_get()
+            except (KeyError, tk.TclError):
+                w = None
+            if isinstance(w, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox, tk.Text)):
+                return None
+        if self.busy and action != "exit":
+            return None
+        self.key_actions()[action]()
         return "break"
+
+    def toggle_mode(self):
+        self.mode_var.set("manual" if self.mode_var.get() == "auto" else "auto")
+        self.on_mode_change()
+
+    def toggle_finish(self):
+        self.finish.set("nonfoil" if self.finish.get() == "foil" else "foil")
+        self.on_finish_change()
+
+    # ------------------------------------------------------ settings window
+    def set_option(self, name, value):
+        self.settings[name] = value
+        save_json(SETTINGS_FILE, self.settings)
+        if name == "auto_hold":
+            self.auto_hold_s = _num(value, 1.0, 0.5, 3.0)
+        elif name == "blur_min":
+            self.blur_min = _num(value, 45.0, 20.0, 90.0)
+        elif name == "check_updates":
+            self.check_updates = bool(value)
+
+    def open_settings(self):
+        if self.busy:
+            return
+        if self.settings_window is not None:
+            try:
+                self.settings_window.lift()
+                return
+            except tk.TclError:
+                self.settings_window = None
+        self.settings_window = SettingsWindow(self.root, self)
+
+    def open_readme(self):
+        base = Path(sys.executable).parent if IS_BUILT else Path(__file__).resolve().parent
+        path = base / "README.md"
+        if path.exists():
+            open_folder(path)
+        else:
+            messagebox.showinfo(APP_NAME, "The read me wasn't found next to the app. "
+                                "It is also on your GitHub page.")
+
+    # ------------------------------------------------------------- updates
+    def update_repo(self):
+        return (self.settings.get("update_repo") or BUILD_INFO.get("repo") or "").strip()
+
+    def start_update_check(self, manual):
+        if not IS_BUILT:
+            if manual:
+                messagebox.showinfo(APP_NAME, "You're running from the source code. Updates are "
+                                    "for the installed app.")
+            return
+        repo, current = self.update_repo(), APP_VERSION
+        if manual:
+            self.set_status("Checking for updates...")
+
+        def work():
+            try:
+                self._bgq.put(("update", manual, find_update(repo, current)))
+            except UpdateError as e:
+                self._bgq.put(("update_error", manual, str(e)))
+            except Exception as e:  # noqa: BLE001
+                self._bgq.put(("update_error", manual, f"Couldn't check for updates ({type(e).__name__})."))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def poll_bg(self):
+        try:
+            while True:
+                try:
+                    item = self._bgq.get_nowait()
+                except queue.Empty:
+                    break
+                self.handle_bg(*item)
+        finally:
+            self.root.after(300, self.poll_bg)
+
+    def handle_bg(self, kind, manual, value):
+        if kind == "update_error":
+            if manual:
+                self.set_status(value)
+                messagebox.showerror(APP_NAME, value)
+        elif kind == "update":
+            self.pending_update = value
+            if self.update_btn is not None:
+                if value:
+                    self.update_btn.configure(text=f"Update to {value['version']}", style="Accent.TButton")
+                else:
+                    self.update_btn.configure(text="Check for updates", style="Small.TButton")
+            if value:
+                self.set_status(f"Version {value['version']} is available - click Update in the top right.")
+                if manual:
+                    self.show_update_dialog()
+            elif manual:
+                self.set_status("You're up to date.")
+                messagebox.showinfo(APP_NAME, f"You're up to date (version {APP_VERSION}).")
+
+    def on_update_click(self):
+        if self.pending_update:
+            self.show_update_dialog()
+        else:
+            self.start_update_check(True)
+
+    def show_update_dialog(self):
+        if self.pending_update:
+            UpdateDialog(self.root, self, self.pending_update)
 
     def on_mode_change(self):
         self.settings["mode"] = self.mode_var.get()
         save_json(SETTINGS_FILE, self.settings)
-        self.auto_hold = 0
+        self.auto_t0 = None
         self.auto_armed = True
         self.set_status("Auto mode: hold a card still in the frame and it is captured for you "
                         "to confirm." if self.mode_var.get() == "auto" else "Manual mode: press Space to snap.")
@@ -2603,7 +3245,7 @@ class ScannerApp:
         finally:
             self.busy = False
             self.auto_armed = False        # auto mode waits until the card is taken away
-            self.auto_hold = 0
+            self.auto_t0 = None
         try:
             self.canvas.focus_set()
         except tk.TclError:
