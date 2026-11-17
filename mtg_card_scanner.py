@@ -28,6 +28,7 @@ Developers can run it from source:
     python mtg_card_scanner.py
 """
 
+import csv
 import datetime
 import difflib
 import hashlib
@@ -38,6 +39,7 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -100,7 +102,9 @@ DATA_DIR = Path.home() / "Documents" / "MTG Card Scanner"
 SCANS_DIR = DATA_DIR / "Scans"
 EXPORT_DIR = DATA_DIR / "Exports"
 DEBUG_DIR = DATA_DIR / "Debug"
-CARDS_FILE = DATA_DIR / "cards.json"
+CARDS_FILE = DATA_DIR / "cards.json"          # the old single list; becomes the first deck
+DECKS_DIR = DATA_DIR / "Decks"
+DEFAULT_DECK = "My Collection"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 NAMES_FILE = DATA_DIR / "card_names.json"
 SETS_FILE = DATA_DIR / "sets.json"
@@ -167,7 +171,7 @@ COLOR_FILTERS = ["All", "White", "Blue", "Black", "Red", "Green",
 
 # ------------------------------------------------------------ local storage
 def ensure_dirs():
-    for d in (DATA_DIR, SCANS_DIR, EXPORT_DIR):
+    for d in (DATA_DIR, SCANS_DIR, EXPORT_DIR, DECKS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -184,8 +188,66 @@ def save_json(path, data):
     os.replace(tmp, path)  # safe write: never leaves a half-written file
 
 
-def load_cards():
-    cards = load_json(CARDS_FILE, [])
+_BAD_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+             *(f"lpt{i}" for i in range(1, 10))}
+
+
+def clean_deck_name(text):
+    """A name that is safe to use as a file name on Windows."""
+    n = _BAD_NAME.sub(" ", str(text or ""))
+    n = re.sub(r"\s+", " ", n).strip(" .")
+    return n[:60].strip(" .")
+
+
+def deck_name_problem(name, existing=(), current=None):
+    """None if the name is fine, otherwise a sentence saying what is wrong."""
+    n = clean_deck_name(name)
+    if not n:
+        return "Type a name for the deck."
+    if n.lower() in _RESERVED or n.lower().split(".")[0] in _RESERVED:
+        return "Windows doesn't allow that name. Try another."
+    if any(e.lower() == n.lower() and e != current for e in existing):
+        return f"You already have a deck called {n}."
+    return None
+
+
+def deck_path(name):
+    return DECKS_DIR / f"{name}.json"
+
+
+def list_decks():
+    try:
+        return sorted((p.stem for p in DECKS_DIR.glob("*.json")), key=str.lower)
+    except OSError:
+        return []
+
+
+def prepare_decks():
+    """Make sure at least one deck exists. The old cards.json becomes the first deck
+    (and is left where it is, as a backup)."""
+    DECKS_DIR.mkdir(parents=True, exist_ok=True)
+    if list_decks():
+        return
+    target = deck_path(DEFAULT_DECK)
+    if CARDS_FILE.exists():
+        target.write_bytes(CARDS_FILE.read_bytes())
+    else:
+        save_json(target, [])
+
+
+def load_cards(path=None):
+    path = Path(path or CARDS_FILE)
+    cards = []
+    if path.exists():
+        try:
+            cards = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            try:    # unreadable: keep a copy so a later save can't destroy it
+                shutil.copy2(path, str(path) + f".damaged-{int(time.time())}")
+            except OSError:
+                pass
+            cards = []
     if not isinstance(cards, list):
         cards = []
     for i, c in enumerate(cards):
@@ -737,8 +799,11 @@ ACTIONS = [
     ("qty_down", "-1 on the selected cards", "minus"),
     ("flip", "Switch the selected cards foil / non-foil", "f"),
     ("remove", "Remove the selected cards", "Delete"),
+    ("new_deck", "Start a new deck", "Control-n"),
+    ("next_deck", "Switch to the next deck", "d"),
     ("export_view", "Export the current view", "Control-e"),
     ("export_all", "Export all cards", ""),
+    ("export_sites", "Export for other websites", ""),
     ("settings", "Open Settings", "Control-comma"),
     ("update", "Check for updates", ""),
     ("exit", "Exit the app", "Control-q"),
@@ -2012,6 +2077,60 @@ def write_export(path, rows, header_lines):
         f.write(f"{count} cards ({len(rows)} different), total value {money(total)}\n")
 
 
+# ---------------------------------------------- export for other websites
+def set_code_map(sets):
+    """{set name in lower case: set code}, for cards saved before the code was kept."""
+    out = {}
+    for code, x in (getattr(sets, "codes", None) or {}).items():
+        if x.get("name"):
+            out.setdefault(str(x["name"]).lower(), code)
+    return out
+
+
+def card_set_code(c, name_map):
+    return str(c.get("set_code") or "").lower() or name_map.get(str(c.get("set", "")).lower(), "")
+
+
+def site_text_lines(rows, name_map):
+    """One line per card in the format deck sites read:  2 Lightning Bolt (M20) 152 *F*
+    Returns (lines, how many had no set code to give)."""
+    lines, missing = [], 0
+    for c in rows:
+        code = card_set_code(c, name_map)
+        line = f"{c['qty']} {c['name']}"
+        if code:
+            line += f" ({code.upper()})" + (f" {c['number']}" if c.get("number") else "")
+        else:
+            missing += 1
+        if c.get("finish") == "foil":
+            line += " *F*"
+        lines.append(line)
+    return lines, missing
+
+
+SITE_CSV_HEADER = ["Count", "Name", "Edition", "Set Code", "Card Number", "Foil", "Scryfall ID"]
+
+
+def write_site_text(path, rows, name_map):
+    lines, missing = site_text_lines(rows, name_map)
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")   # no header, no BOM
+    return missing
+
+
+def write_site_csv(path, rows, name_map):
+    missing = 0
+    with open(path, "w", encoding="utf-8", newline="") as f:      # plain UTF-8: a BOM breaks some importers
+        w = csv.writer(f)
+        w.writerow(SITE_CSV_HEADER)
+        for c in rows:
+            code = card_set_code(c, name_map)
+            missing += not code
+            w.writerow([c["qty"], c["name"], "" if c.get("set") in (None, "?") else c["set"],
+                        code.upper(), c.get("number", ""), "foil" if c.get("finish") == "foil" else "",
+                        c.get("sid", "")])
+    return missing
+
+
 # ------------------------------------------------------------------ webcam
 class CameraStream:
     """Reads the webcam in a background thread, so the window never waits on it
@@ -2502,6 +2621,94 @@ def center_on(win, parent):
 
 
 # ------------------------------------------------------------ add-card popup
+class SiteExportDialog(tk.Toplevel):
+    """Pick what to export for other websites. result = (format, scope) or None."""
+
+    def __init__(self, parent, deck):
+        super().__init__(parent)
+        self.configure(bg=C["bg"])
+        self.title("Export for websites")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        self.fmt = tk.StringVar(value="text")
+        self.scope = tk.StringVar(value="all")
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"Export the deck \"{deck}\"", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Format", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
+        ttk.Radiobutton(body, text="Text list  -  paste into Moxfield, Archidekt, Manabox and similar",
+                        value="text", variable=self.fmt).pack(anchor="w")
+        ttk.Label(body, text="    Looks like:  2 Lightning Bolt (M20) 152   and   1 Forest (M20) 280 *F*",
+                  style="Muted.TLabel").pack(anchor="w")
+        ttk.Radiobutton(body, text="CSV file  -  for collection importers (Deckbox and others)",
+                        value="csv", variable=self.fmt).pack(anchor="w", pady=(6, 0))
+        ttk.Label(body, text="Cards", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
+        ttk.Radiobutton(body, text="The whole deck", value="all", variable=self.scope).pack(anchor="w")
+        ttk.Radiobutton(body, text="Only what is shown now (the type / color filters)",
+                        value="view", variable=self.scope).pack(anchor="w")
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(16, 0))
+        ttk.Button(row, text="Save...", style="Accent.TButton", command=self.ok).pack(side="right")
+        ttk.Button(row, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 8))
+        self.bind("<Escape>", lambda e: self.destroy())
+        center_on(self, parent)
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def ok(self):
+        self.result = (self.fmt.get(), self.scope.get())
+        self.destroy()
+
+
+class NameDialog(tk.Toplevel):
+    """Asks for a deck name. validate(name) returns a problem sentence or None."""
+
+    def __init__(self, parent, title, prompt, initial="", validate=None):
+        super().__init__(parent)
+        self.configure(bg=C["bg"])
+        self.title(title)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        self.validate = validate
+        self.var = tk.StringVar(value=initial)
+        self.msg = tk.StringVar()
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=prompt, style="Section.TLabel").pack(anchor="w")
+        self.entry = ttk.Entry(body, textvariable=self.var, width=36, font=F(12))
+        self.entry.pack(fill="x", pady=(8, 4))
+        ttk.Label(body, textvariable=self.msg, style="Muted.TLabel", wraplength=360,
+                  justify="left").pack(anchor="w", pady=(0, 10))
+        row = ttk.Frame(body)
+        row.pack(fill="x")
+        ttk.Button(row, text="OK", style="Accent.TButton", command=self.ok).pack(side="right")
+        ttk.Button(row, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 8))
+        self.entry.bind("<Return>", lambda e: self.ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        center_on(self, parent)
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+
+    def ok(self):
+        name = clean_deck_name(self.var.get())
+        problem = self.validate(name) if self.validate else None
+        if problem:
+            self.msg.set(problem)
+            return
+        self.result = name
+        self.destroy()
+
+
 class AddCardDialog(tk.Toplevel):
     """Shown after a snap: reads the card, lists the best guesses with artwork,
     lets you pick the printing, finish and quantity - or find it by set + number."""
@@ -3380,7 +3587,11 @@ class ScannerApp:
         self.settings_window = None
         self._bound = []
         self._bgq = queue.Queue()
-        self.cards = load_cards()
+        prepare_decks()
+        names = list_decks()
+        self.deck = self.settings.get("deck") if self.settings.get("deck") in names else names[0]
+        self.deck_var = tk.StringVar(value=self.deck)
+        self.cards = load_cards(deck_path(self.deck))
         self.catalog = NameCatalog(NAMES_FILE)
         self.catalog.start()
         self.sets = SetCatalog(SETS_FILE)
@@ -3424,6 +3635,7 @@ class ScannerApp:
         self.phone_window = None
 
         self.build_ui()
+        self.root.title(f"{APP_NAME} - {self.deck}")
         self.start_camera()
         self.refresh_table()
         self.update_preview()
@@ -3454,7 +3666,7 @@ class ScannerApp:
         tiles.grid(row=0, column=1, sticky="e")
         t1, self.tile_count = stat_tile(tiles, "Cards shown")
         t2, self.tile_view = stat_tile(tiles, "Value of this view")
-        t3, self.tile_all = stat_tile(tiles, "Whole collection")
+        t3, self.tile_all = stat_tile(tiles, "Whole deck")
         for t in (t1, t2, t3):
             t.pack(side="left", padx=(8, 0))
         hb = ttk.Frame(head)
@@ -3563,8 +3775,21 @@ class ScannerApp:
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(1, weight=1)
 
-        bar = ttk.Frame(panel, style="Panel.TFrame")
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top = ttk.Frame(panel, style="Panel.TFrame")
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        deckbar = ttk.Frame(top, style="Panel.TFrame")
+        deckbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(deckbar, text="Deck", style="PanelMuted.TLabel").pack(side="left", padx=(0, 6))
+        self.deck_box = ttk.Combobox(deckbar, textvariable=self.deck_var, values=list_decks(),
+                                     width=24, state="readonly")
+        self.deck_box.pack(side="left", padx=(0, 10))
+        self.deck_box.bind("<<ComboboxSelected>>", lambda e: self.switch_deck(self.deck_var.get()))
+        for text, cmd in (("New deck", self.new_deck), ("Rename", self.rename_deck),
+                          ("Delete", self.delete_deck)):
+            ttk.Button(deckbar, text=text, style="Small.TButton", command=cmd,
+                       takefocus=0).pack(side="left", padx=(0, 6))
+        bar = ttk.Frame(top, style="Panel.TFrame")
+        bar.pack(fill="x")
         for label, var, values, width in (
                 ("Type", self.type_var, TYPE_FILTERS, 11),
                 ("Color", self.color_var, COLOR_FILTERS, 10),
@@ -3606,6 +3831,11 @@ class ScannerApp:
                                  ("My files", lambda: open_folder(DATA_DIR), "TButton")):
             ttk.Button(btns, text=text, command=cmd, style=style,
                        takefocus=0).pack(side="left", padx=(0, 6))
+
+        btns2 = ttk.Frame(panel, style="Panel.TFrame")
+        btns2.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(btns2, text="Export for websites...", command=self.export_sites,
+                   takefocus=0).pack(side="left")
 
         tk.Label(root, textvariable=self.status_var, anchor="w", bg=C["panel"],
                  fg=C["muted"], font=F(9), padx=22, pady=6).grid(
@@ -3798,8 +4028,8 @@ class ScannerApp:
         return {"snap": self.snap, "auto": self.toggle_mode, "finish": self.toggle_finish, "card_mode": self.toggle_card_mode,
                 "phone": self.open_phone, "photo": self.scan_file, "add_name": self.add_by_name,
                 "qty_up": lambda: self.change_qty(1), "qty_down": lambda: self.change_qty(-1),
-                "flip": self.flip_selected, "remove": self.remove_selected,
-                "export_view": self.export_view, "export_all": self.export_all,
+                "new_deck": self.new_deck, "next_deck": self.next_deck, "flip": self.flip_selected, "remove": self.remove_selected,
+                "export_view": self.export_view, "export_all": self.export_all, "export_sites": self.export_sites,
                 "settings": self.open_settings,
                 "update": lambda: self.start_update_check(True), "exit": self.on_close}
 
@@ -4042,7 +4272,117 @@ class ScannerApp:
         return [c for c in self.cards if c["id"] in ids]
 
     def save_cards(self):
-        save_json(CARDS_FILE, self.cards)
+        save_json(deck_path(self.deck), self.cards)
+
+    # ------------------------------------------------------------- decks
+    def _ask_deck_name(self, title, prompt, initial, validate):
+        dlg = NameDialog(self.root, title, prompt, initial, validate)
+        self.root.wait_window(dlg)
+        return dlg.result
+
+    def _decks_changed(self):
+        self.deck_box.configure(values=list_decks())
+        self.deck_var.set(self.deck)
+        self.root.title(f"{APP_NAME} - {self.deck}")
+
+    def _open_deck(self, name):
+        self.save_cards()
+        self.deck = name
+        self.cards = load_cards(deck_path(name))
+        self.settings["deck"] = name
+        save_json(SETTINGS_FILE, self.settings)
+        self._decks_changed()
+        self.refresh_table()
+        self.set_status(f"Deck: {name}  ({sum(c['qty'] for c in self.cards)} cards)")
+
+    def switch_deck(self, name):
+        if self.busy or name == self.deck:
+            self.deck_var.set(self.deck)
+            return
+        if name not in list_decks():
+            self.deck_var.set(self.deck)
+            self.deck_box.configure(values=list_decks())
+            return
+        self._open_deck(name)
+        self.canvas.focus_set()
+
+    def next_deck(self):
+        names = list_decks()
+        if len(names) > 1 and self.deck in names:
+            self.switch_deck(names[(names.index(self.deck) + 1) % len(names)])
+
+    def new_deck(self):
+        if self.busy:
+            return
+        self.busy = True
+        try:
+            name = self._ask_deck_name("New deck", "What should the new deck be called?", "",
+                                       lambda n: deck_name_problem(n, list_decks()))
+        finally:
+            self.busy = False
+        if not name:
+            self.canvas.focus_set()
+            return
+        save_json(deck_path(name), [])
+        self._open_deck(name)
+        self.canvas.focus_set()
+
+    def rename_deck(self):
+        if self.busy:
+            return
+        old = self.deck
+        self.busy = True
+        try:
+            name = self._ask_deck_name("Rename deck", f"New name for {old}:", old,
+                                       lambda n: deck_name_problem(n, list_decks(), current=old))
+        finally:
+            self.busy = False
+        if not name or name == old:
+            self.canvas.focus_set()
+            return
+        self.save_cards()
+        try:
+            os.replace(deck_path(old), deck_path(name))
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't rename the deck:\n{e}")
+            return
+        self.deck = name
+        self.settings["deck"] = name
+        save_json(SETTINGS_FILE, self.settings)
+        self._decks_changed()
+        self.set_status(f"Renamed to {name}")
+        self.canvas.focus_set()
+
+    def delete_deck(self):
+        if self.busy:
+            return
+        names = list_decks()
+        if len(names) <= 1:
+            messagebox.showinfo(APP_NAME, "This is your only deck, so it can't be deleted. "
+                                "Start a new deck first.")
+            return
+        count = sum(c["qty"] for c in self.cards)
+        if not messagebox.askyesno(APP_NAME, f"Delete the deck \"{self.deck}\" ({count} cards)?\n\n"
+                                   "It is moved to the Deleted folder inside Decks, so you can get it back."):
+            return
+        self.save_cards()
+        gone = self.deck
+        trash = DECKS_DIR / "Deleted"
+        try:
+            trash.mkdir(exist_ok=True)
+            os.replace(deck_path(gone), trash / f"{gone} {datetime.datetime.now():%Y-%m-%d_%H-%M-%S}.json")
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't delete the deck:\n{e}")
+            return
+        rest = list_decks()
+        self.deck = rest[0]
+        self.cards = load_cards(deck_path(self.deck))
+        self.settings["deck"] = self.deck
+        save_json(SETTINGS_FILE, self.settings)
+        self._decks_changed()
+        self.refresh_table()
+        self.set_status(f"Deleted {gone}. Now showing {self.deck}.")
+        self.canvas.focus_set()
 
     # ---------------------------------------------------------- adding cards
     def snap(self):
@@ -4247,7 +4587,8 @@ class ScannerApp:
         if not rows:
             messagebox.showinfo(APP_NAME, "There are no cards to export.")
             return
-        default = f"mtg_cards_{label}_{datetime.datetime.now():%Y-%m-%d_%H-%M}.txt"
+        header_lines = [f"Deck: {self.deck}"] + list(header_lines)
+        default = f"{self.deck}_{label}_{datetime.datetime.now():%Y-%m-%d_%H-%M}.txt"
         path = filedialog.asksaveasfilename(
             parent=self.root, title="Save text file", initialdir=str(EXPORT_DIR),
             initialfile=default, defaultextension=".txt",
@@ -4260,6 +4601,43 @@ class ScannerApp:
             messagebox.showerror(APP_NAME, f"Couldn't save the file:\n{e}")
             return
         self.set_status(f"Saved {len(rows)} lines to {path}")
+
+    def export_sites(self):
+        """Text list or CSV that other sites (Moxfield, Archidekt, Deckbox, Manabox ...) can read."""
+        if self.busy:
+            return
+        if not self.cards:
+            messagebox.showinfo(APP_NAME, "There are no cards to export.")
+            return
+        dlg = SiteExportDialog(self.root, self.deck)
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+        fmt, scope = dlg.result
+        rows = self.current_view() if scope == "view" else sorted(self.cards, key=SORT_FUNCS[self.sort_var.get()])
+        if not rows:
+            messagebox.showinfo(APP_NAME, "There are no cards to export.")
+            return
+        ext = ".csv" if fmt == "csv" else ".txt"
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save for websites", initialdir=str(EXPORT_DIR),
+            initialfile=f"{self.deck}_for-websites_{datetime.datetime.now():%Y-%m-%d_%H-%M}{ext}",
+            defaultextension=ext,
+            filetypes=[("CSV file", "*.csv")] if fmt == "csv" else [("Text file", "*.txt")])
+        if not path:
+            return
+        try:
+            names = set_code_map(self.sets)
+            missing = (write_site_csv if fmt == "csv" else write_site_text)(path, rows, names)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't save the file:\n{e}")
+            return
+        self.set_status(f"Saved {len(rows)} lines for websites to {path}")
+        if missing:
+            messagebox.showinfo(APP_NAME, f"{missing} of {len(rows)} lines have no set code (cards added "
+                                "by hand with a custom value, or scanned before the set code was saved "
+                                "and the set list hasn't loaded). Those lines have only the name, so a "
+                                "site will pick a printing for you.")
 
     def export_view(self):
         self._export(self.current_view(), [
