@@ -1,4 +1,4 @@
-[README (1).md](https://github.com/user-attachments/files/34993628/README.1.md)
+[README (2).md](https://github.com/user-attachments/files/34994343/README.2.md)
 # MTG Card Scanner
 
 A Windows desktop app that identifies Magic: The Gathering cards from a webcam or a phone
@@ -278,7 +278,7 @@ source.
 
 If something odd happens, turn on **Camera > Save diagnostic pictures**, scan the card, and look
 in `Documents/MTG Card Scanner/Debug/`. Each scan saves its photos and a `result.txt` listing
-what was read and each guess's name and artwork scores, plus the small print it saw at the bottom-left and crops of the areas it read (`crop_collector.jpg`, `crop_type.jpg`, ...). Sending those to the developer is the fastest way to improve the reading.
+what was read and each guess's name and artwork scores, plus the small print it saw at the bottom-left and crops of the areas it read (`crop_collector.jpg`, `crop_body.jpg`, ...). Sending those to the developer is the fastest way to improve the reading.
 
 ---
 
