@@ -1,10 +1,15 @@
 """
 MTG Card Scanner - desktop app
 ==============================
-Hold a Magic: The Gathering card up to your webcam (or load a photo of it),
-and the app finds the card, straightens it, reads the name, and suggests the
-most likely cards with their artwork. Pick the right one, choose the printing,
-and it is added to your list with its price from Scryfall.
+Hold a Magic: The Gathering card up to your webcam (or send a photo from your
+phone), and the app finds the card, straightens it, reads the name, and
+suggests the most likely cards with their artwork. You confirm the right one,
+pick the printing, and it is added to your list with its price from Scryfall.
+
+Ways to add a card:
+  * Webcam - press Space, or switch to Auto and just hold the card still
+  * Phone  - scan a QR code, take a photo, it appears on the PC
+  * Photo file, or type a name, or a set code + collector number (TLA 58)
 
 Everything is saved on your own computer in:
 
@@ -31,6 +36,8 @@ import json
 import os
 import queue
 import re
+import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -38,7 +45,9 @@ import time
 import unicodedata
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -48,22 +57,39 @@ import numpy as np
 import requests
 from PIL import Image, ImageTk
 
-# Card-name reader. RapidOCR ships its own models inside the app, so there is
-# nothing extra to install. If it can't load, you just type the name instead.
-try:
-    from rapidocr_onnxruntime import RapidOCR
-    HAVE_OCR = True
-except Exception:
-    HAVE_OCR = False
+# ------------------------------------------------------- card-name reader (OCR)
+# RapidOCR ships its own models inside the app, so there is nothing extra to
+# install. It is loaded in the background at start-up so the window opens
+# instantly; if it can't load, you just type the name instead.
+_OCR = {"engine": None, "error": None}
+OCR_READY = threading.Event()
 
-_OCR_ENGINE = None
+
+def _load_ocr():
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        engine = RapidOCR()
+        engine(np.full((48, 240, 3), 255, np.uint8))     # warm-up run
+        _OCR["engine"] = engine
+    except Exception as e:  # noqa: BLE001
+        _OCR["error"] = e
+    finally:
+        OCR_READY.set()
+
+
+def start_ocr_warmup():
+    threading.Thread(target=_load_ocr, daemon=True).start()
 
 
 def _get_ocr_engine():
-    global _OCR_ENGINE
-    if _OCR_ENGINE is None:  # load once, on first use (takes a second or two)
-        _OCR_ENGINE = RapidOCR()
-    return _OCR_ENGINE
+    OCR_READY.wait(timeout=120)
+    if _OCR["engine"] is None:
+        raise RuntimeError("the card-name reader isn't available")
+    return _OCR["engine"]
+
+
+def ocr_available():
+    return not (OCR_READY.is_set() and _OCR["engine"] is None)
 
 
 # ----------------------------------------------------------------- settings
@@ -83,14 +109,21 @@ RESOLUTIONS = [("1280 x 720", 1280, 720),
 CARD_W, CARD_H = 630, 880            # size of a straightened card image
 CARD_RATIO = 63 / 88                 # width / height of a real card
 BOX_HEIGHT_FRACTION = 0.92           # size of the guide frame
-HEADERS = {"User-Agent": "MTGCardScannerApp/1.1", "Accept": "application/json"}
+AUTO_HOLD_FRAMES = 15                # auto mode: frames the card must stay ready and still
+HEADERS = {"User-Agent": "MTGCardScannerApp/1.2", "Accept": "application/json"}
 API = "https://api.scryfall.com"
 
+
+def line_total(c):
+    return c["price"] * c.get("qty", 1)
+
+
 SORT_MODES = [
-    ("Value: high to low", lambda c: -c["price"]),
-    ("Value: low to high", lambda c: c["price"]),
+    ("Value: high to low", lambda c: -line_total(c)),
+    ("Value: low to high", lambda c: line_total(c)),
     ("Name: A to Z",       lambda c: c["name"].lower()),
     ("Set: A to Z",        lambda c: (c["set"].lower(), c["name"].lower())),
+    ("Quantity: most first", lambda c: (-c["qty"], c["name"].lower())),
     ("Scan order",         lambda c: c["scanned_at"]),
 ]
 SORT_FUNCS = dict(SORT_MODES)
@@ -139,7 +172,18 @@ def load_cards():
         c.setdefault("finish", "nonfoil")
         c.setdefault("price", c["price_nonfoil"])
         c.setdefault("scanned_at", 0)
+        try:
+            c["qty"] = max(1, int(c.get("qty") or 1))
+        except (TypeError, ValueError):
+            c["qty"] = 1
     return cards
+
+
+def same_card(a, b):
+    """Same printing and finish -> scanning it again just adds to the quantity."""
+    return (a["set"] != "?" and
+            (a["name"], a["set"], a["number"], a["finish"]) ==
+            (b["name"], b["set"], b["number"], b["finish"]))
 
 
 def open_folder(path):
@@ -206,13 +250,14 @@ def apply_theme(root):
           background=[("disabled", C["line"]), ("pressed", C["accent_lo"]),
                       ("active", C["accent_hi"])])
     s.configure("Danger.TButton", foreground=C["bad"])
+    s.configure("Small.TButton", padding=(10, 6))
     s.configure("Link.TButton", background=C["panel"], foreground=C["muted"], padding=(2, 4))
     s.map("Link.TButton", foreground=[("active", C["text"])],
           background=[("active", C["panel"])])
 
-    # segmented toggle (used for Non-foil / Foil)
+    # segmented toggle (used for Non-foil / Foil and Manual / Auto)
     s.configure("Seg.Toolbutton", background=C["panel2"], foreground=C["muted"],
-                padding=(20, 8), borderwidth=0, relief="flat", anchor="center")
+                padding=(18, 8), borderwidth=0, relief="flat", anchor="center")
     s.map("Seg.Toolbutton",
           background=[("selected", C["accent"]), ("active", C["hover"])],
           foreground=[("selected", "#ffffff"), ("active", C["text"])])
@@ -241,11 +286,13 @@ def apply_theme(root):
     root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
     root.option_add("*TCombobox*Listbox.font", F(10))
 
-    s.configure("TEntry", fieldbackground=C["panel2"], foreground=C["text"],
-                insertcolor=C["text"], bordercolor=C["line"], lightcolor=C["panel2"],
-                darkcolor=C["panel2"], padding=7)
-    s.map("TEntry", bordercolor=[("focus", C["accent"])],
-          lightcolor=[("focus", C["accent"])], darkcolor=[("focus", C["accent"])])
+    for w in ("TEntry", "TSpinbox"):
+        s.configure(w, fieldbackground=C["panel2"], foreground=C["text"],
+                    insertcolor=C["text"], bordercolor=C["line"], lightcolor=C["panel2"],
+                    darkcolor=C["panel2"], arrowcolor=C["muted"], background=C["panel2"],
+                    padding=7)
+        s.map(w, bordercolor=[("focus", C["accent"])],
+              lightcolor=[("focus", C["accent"])], darkcolor=[("focus", C["accent"])])
 
     s.configure("Treeview", background=C["panel"], fieldbackground=C["panel"],
                 foreground=C["text"], rowheight=30, borderwidth=0, relief="flat", font=F(10))
@@ -350,6 +397,8 @@ def scryfall(method, path, **kwargs):
 
 
 _PRINT_CACHE = {}
+_SEARCH_LOCKS = {}
+_SEARCH_LOCKS_GUARD = threading.Lock()
 
 
 def search_mtg(name):
@@ -357,30 +406,35 @@ def search_mtg(name):
     key = name.strip().lower()
     if key in _PRINT_CACHE:                # asked before: no need to bother Scryfall again
         return [dict(m) for m in _PRINT_CACHE[key]]
-    sort = {"unique": "prints", "order": "released"}
-    r = scryfall("GET", "/cards/search", params={"q": f'!"{name}"', **sort})
-    if r.status_code == 404:  # no exact match -> try fuzzy (forgives typos)
-        r = scryfall("GET", "/cards/named", params={"fuzzy": name})
-        if r.status_code == 200:
-            # re-search using the corrected name so we get every printing
-            fixed = r.json().get("name", name)
-            r2 = scryfall("GET", "/cards/search", params={"q": f'!"{fixed}"', **sort})
-            data = r2.json().get("data", []) if r2.status_code == 200 else [r.json()]
+    with _SEARCH_LOCKS_GUARD:              # two threads asking for the same card share one call
+        lock = _SEARCH_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        if key in _PRINT_CACHE:
+            return [dict(m) for m in _PRINT_CACHE[key]]
+        sort = {"unique": "prints", "order": "released"}
+        r = scryfall("GET", "/cards/search", params={"q": f'!"{name}"', **sort})
+        if r.status_code == 404:  # no exact match -> try fuzzy (forgives typos)
+            r = scryfall("GET", "/cards/named", params={"fuzzy": name})
+            if r.status_code == 200:
+                # re-search using the corrected name so we get every printing
+                fixed = r.json().get("name", name)
+                r2 = scryfall("GET", "/cards/search", params={"q": f'!"{fixed}"', **sort})
+                data = r2.json().get("data", []) if r2.status_code == 200 else [r.json()]
+            else:
+                # last resort: any card whose name contains the words we read
+                r3 = scryfall("GET", "/cards/search", params={"q": name, **sort})
+                if r3.status_code != 200:
+                    return []
+                data = r3.json().get("data", [])
         else:
-            # last resort: any card whose name contains the words we read
-            r3 = scryfall("GET", "/cards/search", params={"q": name, **sort})
-            if r3.status_code != 200:
-                return []
-            data = r3.json().get("data", [])
-    else:
-        r.raise_for_status()
-        data = r.json().get("data", [])
-    out = [_parse_scryfall(c) for c in data[:15]]
-    if out:
-        if len(_PRINT_CACHE) > 60:
-            _PRINT_CACHE.clear()
-        _PRINT_CACHE[key] = [dict(m) for m in out]
-    return out
+            r.raise_for_status()
+            data = r.json().get("data", [])
+        out = [_parse_scryfall(c) for c in data[:15]]
+        if out:
+            if len(_PRINT_CACHE) > 60:
+                _PRINT_CACHE.clear()
+            _PRINT_CACHE[key] = [dict(m) for m in out]
+        return out
 
 
 def apply_finish(card, finish):
@@ -407,12 +461,28 @@ def cards_by_names(names):
     return {c["name"]: c for c in r.json().get("data", [])}
 
 
+def card_by_set_number(set_code, number):
+    """The exact printing from a set code and collector number, e.g. tla / 58."""
+    r = scryfall("GET", f"/cards/{quote(set_code.lower(), safe='')}/{quote(number.lower(), safe='')}")
+    return _parse_scryfall(r.json()) if r.status_code == 200 else None
+
+
+SET_NUMBER_RE = re.compile(r"^\s*([A-Za-z0-9]{2,6})\s*[ /#:\-]\s*(\d{1,4}[A-Za-z★]?)\s*$")
+
+
+def parse_set_number(text):
+    """'TLA 58' / 'tla/58' / 'tla #58' -> ('tla', '58'), otherwise None."""
+    m = SET_NUMBER_RE.match(text)
+    return (m.group(1).lower(), m.group(2).lower()) if m else None
+
+
 def scryfall_autocomplete(text):
     r = scryfall("GET", "/cards/autocomplete", params={"q": text})
     return r.json().get("data", []) if r.status_code == 200 else []
 
 
 def fetch_bytes(url):
+    """Download a file from Scryfall's image server (which has no rate limit)."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -428,6 +498,23 @@ def decode_image(blob):
         return cv2.imdecode(np.frombuffer(blob, np.uint8), cv2.IMREAD_COLOR)
     except Exception:
         return None
+
+
+_IMG_CACHE = {}
+
+
+def fetch_small(url):
+    """A small decoded copy of an artwork picture (cached, so it is only fetched once)."""
+    if url in _IMG_CACHE:
+        return _IMG_CACHE[url]
+    img = decode_image(fetch_bytes(url))
+    if img is None:
+        return None
+    img = cv2.resize(img, (96, 72), interpolation=cv2.INTER_AREA)
+    if len(_IMG_CACHE) > 400:
+        _IMG_CACHE.clear()
+    _IMG_CACHE[url] = img
+    return img
 
 
 # --------------------------------------------------------------- card names
@@ -466,6 +553,7 @@ def read_variants(text):
 
 class NameCatalog:
     """Every Magic card name (from Scryfall), cached on disk, for fuzzy matching."""
+
     def __init__(self, path):
         self.path = Path(path)
         self.entries = []      # (normalised name, display name)
@@ -484,18 +572,19 @@ class NameCatalog:
             age = time.time() - float(data.get("fetched", 0))
         except Exception:
             pass
+        if names:
+            self.build(names)              # use the saved list right away...
         if not names or (age is not None and age > 14 * 86400):
-            try:
+            try:                           # ...and refresh it in the background if old
                 r = scryfall("GET", "/catalog/card-names", timeout=60)
                 r.raise_for_status()
                 fresh = r.json().get("data", [])
                 if fresh:
-                    names = fresh
                     save_json(self.path, {"fetched": time.time(), "names": fresh})
+                    if not names:
+                        self.build(fresh)
             except Exception:
                 pass
-        if names:
-            self.build(names)
 
     def build(self, names):
         entries, seen = [], set()
@@ -759,35 +848,46 @@ def _ocr_once(img):
 
 
 def ocr_read_iter(card, treatments=4):
-    """Yield (text, confidence) reads of the title, trying several image treatments.
-    A generator so the caller can stop as soon as a read is good enough."""
-    if not HAVE_OCR:
+    """Yield (text, confidence) reads of the title, trying several image treatments,
+    cheapest first. A generator so the caller can stop as soon as a read is good."""
+    if not ocr_available():
         return
     h, w = card.shape[:2]
     strip = card[int(h * 0.02):int(h * 0.12), int(w * 0.05):int(w * 0.80)]
     strip = cv2.resize(strip, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-    try:
-        strip = cv2.fastNlMeansDenoisingColored(strip, None, 4, 4, 7, 21)
-    except cv2.error:
-        pass
     gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(gray)
-    soft = cv2.GaussianBlur(clahe, (0, 0), 2.5)
-    sharp = cv2.addWeighted(clahe, 1.8, soft, -0.8, 0)
-    tries = (strip,
-             cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
-             cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR),
-             cv2.cvtColor(255 - clahe, cv2.COLOR_GRAY2BGR))      # light-on-dark titles
-    for img in tries[:treatments]:
-        text, conf = _ocr_once(img)
+
+    def plain():
+        return strip
+
+    def contrast():
+        return cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR)
+
+    def denoised_sharp():
+        try:
+            den = cv2.fastNlMeansDenoising(clahe, None, 6, 7, 21)
+        except cv2.error:
+            den = clahe
+        soft = cv2.GaussianBlur(den, (0, 0), 2.5)
+        return cv2.cvtColor(cv2.addWeighted(den, 1.8, soft, -0.8, 0), cv2.COLOR_GRAY2BGR)
+
+    def inverted():                      # light-on-dark titles
+        return cv2.cvtColor(255 - clahe, cv2.COLOR_GRAY2BGR)
+
+    for make in (plain, contrast, denoised_sharp, inverted)[:treatments]:
+        text, conf = _ocr_once(make())
         if text:
             yield text, conf
 
 
-def recognize(cards, catalog, debug_dir=None, online=True):
+def recognize(cards, catalog, debug_dir=None, online=True, emit=None):
     """Work out which card this is. cards: straightened pictures, sharpest first.
+    emit(kind, value) is called as results arrive so the screen can update early:
+      "names" - text-only guesses (fast), "art" - guesses with artwork.
     Returns {"reads": [...], "cands": [{name, final, name_score, art_score, art_bytes}],
     "notes": [problems worth telling the user about]}"""
+    emit = emit or (lambda kind, value: None)
     prepared = [enhance(c) for c in cards]
     reads, done = [], False
     deadline = time.time() + 14          # never make the user wait much longer than this
@@ -828,9 +928,10 @@ def recognize(cards, catalog, debug_dir=None, online=True):
     ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:6]
     cands = [{"name": n, "name_score": s, "art_score": None, "final": s, "art_bytes": None}
              for n, s in ranked]
+    emit("names", {"cands": [dict(c) for c in cands], "reads": list(reads)})
 
+    photo_art = art_region(prepared[0]) if prepared else None
     if cands and online and prepared:      # compare artwork like a visual search would
-        photo_art = art_region(prepared[0])
         try:                               # ONE request covers every guess
             recs = cards_by_names([c["name"] for c in cands])
         except ScryfallBusy as e:
@@ -844,7 +945,8 @@ def recognize(cards, catalog, debug_dir=None, online=True):
                 rec = recs.get(c["name"])
                 if not rec:
                     return
-                blob = fetch_bytes(_art_url(rec))
+                url = _art_url(rec)
+                blob = fetch_bytes(url)
                 img = decode_image(blob)
                 if img is None:
                     return
@@ -859,6 +961,15 @@ def recognize(cards, catalog, debug_dir=None, online=True):
             if c["art_score"] is not None:
                 c["final"] = min(1.0, 0.65 * c["name_score"] + 0.35 * c["art_score"])
         cands.sort(key=lambda c: -c["final"])
+        emit("art", {"cands": [dict(c) for c in cands]})
+
+    if cands and online and photo_art is not None:   # get the printings ready before they're asked for
+        try:
+            ms = search_mtg(cands[0]["name"])
+            if len(ms) > 1:
+                rank_printings_by_art(photo_art, ms)
+        except Exception:
+            pass
 
     if debug_dir:
         try:
@@ -889,7 +1000,7 @@ def rank_printings_by_art(photo_art, matches):
 
     def score(item):
         i, url = item
-        img = decode_image(fetch_bytes(url))
+        img = fetch_small(url)
         return i, (art_similarity(photo_art, img) if img is not None else None)
 
     with ThreadPoolExecutor(max_workers=6) as ex:
@@ -939,29 +1050,321 @@ def finish_text(card):
     return "Foil" if card["finish"] == "foil" else "Non-foil"
 
 
+def money(v):
+    return f"${v:,.2f}"
+
+
 def write_export(path, rows, header_lines):
-    total = sum(c["price"] for c in rows)
+    total = sum(line_total(c) for c in rows)
+    count = sum(c["qty"] for c in rows)
     name_w = max([len(c["name"]) for c in rows] + [4])
     set_w = max([len(c["set"]) for c in rows] + [3])
     type_w = max([len(main_type(c)) for c in rows] + [4])
     col_w = max([len(color_text(c)) for c in rows] + [5])
-    line_w = name_w + set_w + type_w + col_w + 38
+    line_w = name_w + set_w + type_w + col_w + 56
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("MTG card collection export\n")
         for h in header_lines:
             f.write(h + "\n")
         f.write("=" * line_w + "\n")
-        f.write(f"{'#':>3}  {'Name':<{name_w}}  {'Type':<{type_w}}  "
-                f"{'Color':<{col_w}}  {'Set':<{set_w}}  {'Finish':<8} {'Value':>9}\n")
+        f.write(f"{'#':>3}  {'Qty':>3}  {'Name':<{name_w}}  {'Type':<{type_w}}  "
+                f"{'Color':<{col_w}}  {'Set':<{set_w}}  {'Finish':<8} {'Each':>9} {'Total':>10}\n")
         f.write("-" * line_w + "\n")
         for i, c in enumerate(rows, 1):
-            val = f"${c['price']:,.2f}" if c["price"] else "n/a"
-            f.write(f"{i:>3}  {c['name']:<{name_w}}  {main_type(c):<{type_w}}  "
+            each = money(c["price"]) if c["price"] else "n/a"
+            tot = money(line_total(c)) if c["price"] else "n/a"
+            f.write(f"{i:>3}  {c['qty']:>3}  {c['name']:<{name_w}}  {main_type(c):<{type_w}}  "
                     f"{color_text(c):<{col_w}}  {c['set']:<{set_w}}  "
-                    f"{finish_text(c):<8} {val:>9}\n")
+                    f"{finish_text(c):<8} {each:>9} {tot:>10}\n")
         f.write("-" * line_w + "\n")
-        f.write(f"{len(rows)} cards, total value ${total:,.2f}\n")
+        f.write(f"{count} cards ({len(rows)} different), total value {money(total)}\n")
+
+
+# ------------------------------------------------------------------ webcam
+class CameraStream:
+    """Reads the webcam in a background thread, so the window never waits on it
+    (opening a camera can take a few seconds) and always shows the newest frame."""
+
+    def __init__(self, index, width, height, autofocus, focus):
+        self.index, self.width, self.height = index, width, height
+        self.autofocus, self.focus = autofocus, focus
+        self.state = "opening"                  # opening | live | none | lost
+        self._frame, self._seq = None, 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._cmds = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def _open(idx):
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(idx)
+        if cap is not None and cap.isOpened():
+            return cap
+        if cap is not None:
+            cap.release()
+        return None
+
+    def _apply_focus(self, cap, auto, value):
+        try:  # not every camera supports these; failures are harmless
+            cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if auto else 0)
+            if not auto:
+                cap.set(cv2.CAP_PROP_FOCUS, float(value))
+        except Exception:
+            pass
+
+    def _run(self):
+        cap = self._open(self.index)
+        if cap is None:                          # try the other camera numbers too
+            for i in range(4):
+                if i != self.index:
+                    cap = self._open(i)
+                    if cap is not None:
+                        self.index = i
+                        break
+        if cap is None:
+            self.state = "none"
+            return
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        except Exception:
+            pass
+        self._apply_focus(cap, self.autofocus, self.focus)
+        self.state = "live"
+        misses = 0
+        while not self._stop.is_set():
+            self._do_commands(cap)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                misses = 0
+                with self._lock:
+                    self._frame = frame
+                    self._seq += 1
+            else:
+                misses += 1
+                if misses > 150:
+                    self.state = "lost"
+                    break
+                time.sleep(0.02)
+        cap.release()
+
+    def _do_commands(self, cap):
+        while True:
+            try:
+                cmd = self._cmds.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if cmd[0] == "focus":
+                    self._apply_focus(cap, cmd[1], cmd[2])
+                elif cmd[0] == "settings":
+                    cap.set(cv2.CAP_PROP_SETTINGS, 1)
+            except Exception:
+                pass
+
+    def send(self, *cmd):
+        self._cmds.put(cmd)
+
+    def latest(self):
+        with self._lock:
+            return self._frame, self._seq
+
+    def stop(self):
+        self._stop.set()
+
+
+# -------------------------------------------------------------- phone link
+PHONE_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MTG Card Scanner</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#13151b;color:#e9ebf2;padding:22px;text-align:center}
+ h1{font-size:22px;margin:8px 0 4px}
+ p{color:#8f96a8;line-height:1.45;margin:6px 0 18px}
+ label.btn{display:block;background:#6d8bff;color:#fff;font-weight:700;font-size:20px;padding:20px;border-radius:14px;margin:12px 0}
+ label.alt{background:#252938;font-size:16px;padding:14px;font-weight:600;color:#c8cddc}
+ img{max-width:100%;max-height:42vh;border-radius:10px;margin:10px 0}
+ #msg{font-size:18px;min-height:28px;margin-top:8px}
+ .ok{color:#38d996}.warn{color:#ffb547}
+</style></head><body>
+<h1>MTG Card Scanner</h1>
+<p>Fill the frame with one card, hold steady, and make sure it is well lit.
+Each photo is sent to your computer, where you confirm it.</p>
+<label class="btn">Take a photo<input id="cam" type="file" accept="image/*" capture="environment" hidden></label>
+<label class="btn alt">Choose a saved photo<input id="pick" type="file" accept="image/*" hidden></label>
+<img id="pv" alt="" hidden>
+<div id="msg"></div>
+<script>
+const base = location.pathname.replace(/\/?$/, "/");
+const msg = document.getElementById("msg"), pv = document.getElementById("pv");
+function say(t, cls){ msg.textContent = t; msg.className = cls || ""; }
+async function send(file){
+  if(!file) return;
+  pv.src = URL.createObjectURL(file); pv.hidden = false;
+  say("Sending...");
+  try{
+    const r = await fetch(base + "upload", {method: "POST", body: file});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error || "upload failed");
+    say("Sent! Confirm it on the computer.", "ok");
+    poll(j.id);
+  }catch(e){ say("Couldn't send: " + e.message, "warn"); }
+}
+async function poll(id){
+  for(let i = 0; i < 600; i++){
+    await new Promise(r => setTimeout(r, 1200));
+    try{
+      const j = await (await fetch(base + "status?id=" + id)).json();
+      if(j.state === "added"){ say("Added: " + j.text, "ok"); return; }
+      if(j.state === "skipped"){ say("Skipped. Take another photo when ready.", "warn"); return; }
+    }catch(e){}
+  }
+}
+for(const id of ["cam", "pick"]){
+  document.getElementById(id).addEventListener("change", e => { send(e.target.files[0]); e.target.value = ""; });
+}
+</script></body></html>
+"""
+
+
+def lan_ip():
+    """This computer's address on the home network (what a phone must connect to)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))           # no data is sent; it just picks the right network
+        return s.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def make_qr_image(text, box=8):
+    """A QR code as a picture (PIL image), or None if this OpenCV can't make one."""
+    try:
+        enc = (cv2.QRCodeEncoder.create() if hasattr(cv2.QRCodeEncoder, "create")
+               else cv2.QRCodeEncoder_create())
+        qr = enc.encode(text)
+        if qr is None or qr.size == 0:
+            return None
+        qr = cv2.copyMakeBorder(qr, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=255)
+        qr = cv2.resize(qr, None, fx=box, fy=box, interpolation=cv2.INTER_NEAREST)
+        return Image.fromarray(qr).convert("RGB")
+    except Exception:
+        return None
+
+
+class PhoneLink:
+    """A tiny web page served from this PC. A phone on the same Wi-Fi opens it
+    (via a QR code), takes a photo of a card, and the photo lands in `incoming`."""
+    MAX_BYTES = 25 * 1024 * 1024
+
+    def __init__(self):
+        self.token = secrets.token_urlsafe(9)     # makes the address impossible to guess
+        self.incoming = queue.Queue()             # (job id, picture)
+        self.status = {}                          # job id -> {"state", "text"}
+        self.received = 0
+        self._next_id = 1
+        self._lock = threading.Lock()
+        self.server = None
+        self.url = ""
+
+    def new_job(self, img):
+        with self._lock:
+            job = self._next_id
+            self._next_id += 1
+            self.status[job] = {"state": "waiting", "text": ""}
+            self.received += 1
+        self.incoming.put((job, img))
+        return job
+
+    def set_status(self, job, state, text=""):
+        with self._lock:
+            self.status[job] = {"state": state, "text": text}
+
+    def get_status(self, job):
+        with self._lock:
+            return dict(self.status.get(job, {"state": "unknown", "text": ""}))
+
+    def start(self):
+        link = self
+        base = f"/s/{self.token}/"
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):
+                pass
+
+            def _reply(self, code, body, ctype="application/json"):
+                data = body if isinstance(body, bytes) else body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                u = urlparse(self.path)
+                if u.path.rstrip("/") == base.rstrip("/"):
+                    self._reply(200, PHONE_PAGE, "text/html; charset=utf-8")
+                elif u.path == base + "status":
+                    try:
+                        job = int(parse_qs(u.query).get("id", ["0"])[0])
+                    except ValueError:
+                        job = 0
+                    self._reply(200, json.dumps(link.get_status(job)))
+                else:
+                    self._reply(404, '{"error": "not found"}')
+
+            def do_POST(self):
+                u = urlparse(self.path)
+                if u.path != base + "upload":
+                    self._reply(404, '{"error": "not found"}')
+                    return
+                try:
+                    n = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    n = 0
+                if n <= 0 or n > link.MAX_BYTES:
+                    self._reply(413, '{"error": "picture too big or empty"}')
+                    return
+                data = self.rfile.read(n)
+                img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                if img is None:
+                    self._reply(400, '{"error": "that does not look like a picture"}')
+                    return
+                self._reply(200, json.dumps({"id": link.new_job(img)}))
+
+        server = None
+        for port in (8765, 8766, 8767, 0):
+            try:
+                server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+                break
+            except OSError:
+                continue
+        if server is None:
+            raise OSError("couldn't open a network port")
+        server.daemon_threads = True
+        self.server = server
+        self.url = f"http://{lan_ip()}:{server.server_address[1]}{base}"
+        threading.Thread(target=lambda: server.serve_forever(poll_interval=0.2),
+                         daemon=True).start()
+
+    def stop(self):
+        if self.server is not None:
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            try:
+                self.server.server_close()
+            except Exception:
+                pass
+            self.server = None
 
 
 # ------------------------------------------------------------ small widgets
@@ -978,10 +1381,20 @@ def hex_to_bgr(h):
     return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
 
 
+def center_on(win, parent):
+    win.update_idletasks()
+    try:
+        x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    except tk.TclError:
+        pass
+
+
 # ------------------------------------------------------------ add-card popup
 class AddCardDialog(tk.Toplevel):
     """Shown after a snap: reads the card, lists the best guesses with artwork,
-    lets you pick the printing and finish."""
+    lets you pick the printing, finish and quantity - or find it by set + number."""
 
     def __init__(self, parent, cards, catalog, finish, debug_dir=None):
         super().__init__(parent)
@@ -998,10 +1411,14 @@ class AddCardDialog(tk.Toplevel):
         self.loaded_name = ""
         self._thumbs = []
         self._job = 0
+        self._typed = False
         self._suggest_after = None
         self.name_var = tk.StringVar()
         self.finish_var = tk.StringVar(value=finish)
         self.value_var = tk.StringVar()
+        self.qty_var = tk.StringVar(value="1")
+        self.set_var = tk.StringVar()
+        self.num_var = tk.StringVar()
         self.msg_var = tk.StringVar()
         self.photo_art = art_region(enhance(cards[0])) if cards else None
 
@@ -1013,31 +1430,32 @@ class AddCardDialog(tk.Toplevel):
         left.grid(row=0, column=0, sticky="n", padx=(0, 18))
         if cards:
             pil = Image.fromarray(cv2.cvtColor(cards[0], cv2.COLOR_BGR2RGB))
-            pil.thumbnail((250, 350))
+            pil.thumbnail((240, 336))
             self._photo = ImageTk.PhotoImage(pil)
             ttk.Label(left, image=self._photo, style="Panel.TLabel").pack()
             ttk.Label(left, text="Your photo, straightened",
                       style="PanelMuted.TLabel").pack(pady=(8, 0))
         else:
-            ttk.Label(left, text="Type a card name\nto add it by hand",
-                      style="PanelMuted.TLabel", justify="center").pack(padx=50, pady=130)
+            ttk.Label(left, text="Type a card name,\nor a set code and number,\nto add it by hand",
+                      style="PanelMuted.TLabel", justify="center").pack(padx=36, pady=120)
 
         # ---- right: name, guesses, printings
         right = ttk.Frame(body)
         right.grid(row=0, column=1, sticky="nsew")
 
-        ttk.Label(right, text="Card name", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(right, text="Card name  (or set code + number, like TLA 58)",
+                  style="Section.TLabel").pack(anchor="w")
         row = ttk.Frame(right)
         row.pack(fill="x", pady=(4, 0))
         self.entry = ttk.Entry(row, textvariable=self.name_var, width=44, font=F(12))
         self.entry.pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Search", command=self.search).pack(side="left", padx=(8, 0))
         ttk.Label(right, textvariable=self.msg_var, style="Muted.TLabel",
-                  wraplength=560, justify="left").pack(anchor="w", pady=(8, 8))
+                  wraplength=580, justify="left").pack(anchor="w", pady=(8, 6))
 
         ttk.Label(right, text="Best guesses", style="Section.TLabel").pack(anchor="w")
         cf = ttk.Frame(right, style="Panel.TFrame")
-        cf.pack(fill="x", pady=(4, 10))
+        cf.pack(fill="x", pady=(4, 8))
         self.cand_tree = ttk.Treeview(cf, columns=("pct",), show="tree", height=3,
                                       style="Cand.Treeview", selectmode="browse")
         self.cand_tree.column("#0", width=440, stretch=True)
@@ -1049,11 +1467,11 @@ class AddCardDialog(tk.Toplevel):
 
         ttk.Label(right, text="Printings", style="Section.TLabel").pack(anchor="w")
         pf = ttk.Frame(right, style="Panel.TFrame")
-        pf.pack(fill="x", pady=(4, 10))
+        pf.pack(fill="x", pady=(4, 8))
         cols = [("set", "Set", 230), ("num", "No.", 55), ("rarity", "Rarity", 75),
                 ("nonfoil", "Non-foil", 75), ("foil", "Foil", 75)]
         self.tree = ttk.Treeview(pf, columns=[c[0] for c in cols], show="headings",
-                                 height=5, selectmode="browse")
+                                 height=4, selectmode="browse")
         for key, text, width in cols:
             self.tree.heading(key, text=text)
             self.tree.column(key, width=width, anchor="w" if key == "set" else "e")
@@ -1062,14 +1480,27 @@ class AddCardDialog(tk.Toplevel):
         self.tree.pack(side="left", fill="x", expand=True)
         psb.pack(side="right", fill="y")
 
+        numrow = ttk.Frame(right)
+        numrow.pack(fill="x", pady=(0, 8))
+        ttk.Label(numrow, text="Or by the number printed on the card:",
+                  style="Muted.TLabel").pack(side="left")
+        ttk.Entry(numrow, textvariable=self.set_var, width=6).pack(side="left", padx=(8, 4))
+        ttk.Label(numrow, text="set", style="Muted.TLabel").pack(side="left")
+        ttk.Entry(numrow, textvariable=self.num_var, width=6).pack(side="left", padx=(8, 4))
+        ttk.Label(numrow, text="no.", style="Muted.TLabel").pack(side="left")
+        ttk.Button(numrow, text="Find", style="Small.TButton",
+                   command=self.find_by_number).pack(side="left", padx=(8, 0))
+
         opts = ttk.Frame(right)
-        opts.pack(fill="x", pady=(0, 12))
+        opts.pack(fill="x", pady=(0, 10))
         ttk.Radiobutton(opts, text="Non-foil", value="nonfoil", variable=self.finish_var,
                         style="Seg.Toolbutton", takefocus=0).pack(side="left")
         ttk.Radiobutton(opts, text="Foil", value="foil", variable=self.finish_var,
                         style="Seg.Toolbutton", takefocus=0).pack(side="left", padx=(2, 0))
-        ttk.Label(opts, text="Custom value $", style="Muted.TLabel").pack(side="left", padx=(24, 6))
-        ttk.Entry(opts, textvariable=self.value_var, width=8).pack(side="left")
+        ttk.Label(opts, text="Quantity", style="Muted.TLabel").pack(side="left", padx=(20, 6))
+        ttk.Spinbox(opts, from_=1, to=999, width=4, textvariable=self.qty_var).pack(side="left")
+        ttk.Label(opts, text="Custom value $", style="Muted.TLabel").pack(side="left", padx=(20, 6))
+        ttk.Entry(opts, textvariable=self.value_var, width=7).pack(side="left")
 
         btns = ttk.Frame(right)
         btns.pack(fill="x")
@@ -1084,11 +1515,8 @@ class AddCardDialog(tk.Toplevel):
         self.tree.bind("<Double-1>", lambda e: self.add())
         self.bind("<Escape>", lambda e: self.destroy())
 
-        self.update_idletasks()
-        try:  # center over the main window
-            x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
-            y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
-            self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        center_on(self, parent)
+        try:
             self.wait_visibility()
             self.grab_set()
         except tk.TclError:
@@ -1096,61 +1524,80 @@ class AddCardDialog(tk.Toplevel):
         self.entry.focus_set()
 
         if cards:
-            self.msg_var.set("Reading the card... (the first scan can take a few seconds)")
-            self._bg(lambda: recognize(self.cards, self.catalog, self.debug_dir),
-                     self._on_recognized)
+            self.msg_var.set("Reading the card...")
+            self._stream(lambda emit: recognize(self.cards, self.catalog, self.debug_dir, emit=emit),
+                         self._on_stage)
         else:
             self.msg_var.set("Type a few letters of the card name - suggestions appear as you type.")
 
     # ---------------------------------------------------------- background work
-    def _bg(self, fn, done):
-        """Run fn in a thread; call done(ok, value) back on the screen thread."""
+    def _alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _stream(self, fn, handler):
+        """Run fn(emit) in a thread. handler(kind, value) is called on the screen
+        thread for each emit(...), then once with "done" (or "error")."""
         q = queue.Queue()
 
         def run():
             try:
-                q.put((True, fn()))
+                q.put(("done", fn(lambda kind, value: q.put((kind, value)))))
             except Exception as e:  # noqa: BLE001 - shown to the user, not hidden
-                q.put((False, e))
+                q.put(("error", e))
 
         threading.Thread(target=run, daemon=True).start()
 
         def poll():
-            try:
-                if not self.winfo_exists():
+            if not self._alive():
+                return
+            while True:
+                try:
+                    kind, val = q.get_nowait()
+                except queue.Empty:
+                    self.after(60, poll)
                     return
-            except tk.TclError:
-                return
-            try:
-                ok, val = q.get_nowait()
-            except queue.Empty:
-                self.after(80, poll)
-                return
-            done(ok, val)
+                handler(kind, val)
+                if kind in ("done", "error"):
+                    return
 
-        self.after(80, poll)
+        self.after(60, poll)
 
-    def _on_recognized(self, ok, val):
-        if not ok:
-            self.msg_var.set("Couldn't read the card automatically. Type a few letters "
-                             "of the name and pick from the suggestions.")
-            return
-        self.cands = val["cands"]
-        self._show_candidates(self.cands)
-        if val["reads"] and not self.name_var.get().strip():
-            self.name_var.set(max(val["reads"], key=lambda r: r[1])[0])
-        if self.cands and self.cands[0]["final"] >= 0.5:
-            msg = (f"Best guess: {self.cands[0]['name']}. Not right? "
-                   "Pick another below, or type the name.")
-            self.cand_tree.selection_set("0")
-        elif self.cands:
-            msg = "Not sure about this one - check the guesses, or type the name."
-        else:
-            msg = ("Couldn't read this card clearly. Type a few letters of the "
-                   "name - suggestions appear as you type.")
-        if val.get("notes"):
-            msg += "  (Scryfall asked us to slow down, so artwork previews are missing for now.)"
-        self.msg_var.set(msg)
+    def _bg(self, fn, done):
+        """Run fn in a thread; call done(ok, value) back on the screen thread."""
+        def handler(kind, val):
+            if kind == "done":
+                done(True, val)
+            elif kind == "error":
+                done(False, val)
+        self._stream(lambda emit: fn(), handler)
+
+    def _on_stage(self, kind, val):
+        if kind == "error":
+            self.msg_var.set("Couldn't read the card automatically. Type a few letters of "
+                             "the name, or use the set code and number.")
+        elif kind == "names":
+            self.cands = val["cands"]
+            self._show_candidates(self.cands)
+            if val["reads"] and not self._typed and not self.name_var.get().strip():
+                self.name_var.set(max(val["reads"], key=lambda r: r[1])[0])
+            if not self.cands:
+                self.msg_var.set("Couldn't read this card clearly. Type a few letters of the "
+                                 "name (suggestions appear as you type), or use the set code and number.")
+            else:
+                self.msg_var.set("Checking the artwork...")
+                if self.cands[0]["final"] >= 0.9:
+                    self._reselect()
+        elif kind == "art":
+            self.cands = val["cands"]
+            self._show_candidates(self.cands)
+            self._reselect()
+            self.msg_var.set("Best guess is highlighted. Not right? Pick another, or type the name.")
+        elif kind == "done" and val.get("notes"):
+            self.msg_var.set(self.msg_var.get() + "  (Scryfall asked us to slow down, "
+                             "so some previews may be missing.)")
 
     # ------------------------------------------------------------ guesses list
     def _show_candidates(self, cands):
@@ -1170,6 +1617,17 @@ class AddCardDialog(tk.Toplevel):
             pct = f"{int(round(c['final'] * 100))}%" if c.get("final") is not None else ""
             self.cand_tree.insert("", "end", iid=str(i), text="  " + c["name"],
                                   image=img, values=(pct,))
+
+    def _reselect(self):
+        """Highlight the best guess (unless the user has already taken over)."""
+        if self._typed or not self.cands:
+            return
+        idx = next((i for i, c in enumerate(self.cands) if c["name"] == self.loaded_name), None)
+        if idx is None:
+            if self.cands[0]["final"] < 0.5:
+                return
+            idx = 0
+        self.cand_tree.selection_set(str(idx))
 
     def _on_cand_select(self, event=None):
         sel = self.cand_tree.selection()
@@ -1195,6 +1653,7 @@ class AddCardDialog(tk.Toplevel):
     def _on_key(self, event):
         if event.keysym in ("Return", "Escape", "Down", "Up", "Tab", "Shift_L", "Shift_R"):
             return
+        self._typed = True
         if self._suggest_after is not None:
             self.after_cancel(self._suggest_after)
         self._suggest_after = self.after(220, self._suggest)
@@ -1205,8 +1664,7 @@ class AddCardDialog(tk.Toplevel):
         if len(text) < 2:
             return
         if self.catalog.ready:
-            names = self.catalog.suggest(text)
-            self._set_suggestions(names)
+            self._set_suggestions(self.catalog.suggest(text))
         else:
             self._job += 1
             token = self._job
@@ -1221,9 +1679,53 @@ class AddCardDialog(tk.Toplevel):
 
     # --------------------------------------------------------------- printings
     def search(self):
-        name = self.name_var.get().strip()
-        if name:
-            self.load_printings(name)
+        text = self.name_var.get().strip()
+        if not text:
+            return
+        self._typed = True
+        sn = parse_set_number(text)
+        if sn:                       # "TLA 58" -> that exact card; if not found, try it as a name
+            self.set_var.set(sn[0].upper())
+            self.num_var.set(sn[1])
+            self._lookup_number(sn[0], sn[1], fallback=text)
+        else:
+            self.load_printings(text)
+
+    def find_by_number(self):
+        set_code, num = self.set_var.get().strip(), self.num_var.get().strip()
+        if not set_code or not num:
+            self.msg_var.set("Type the set code and the number from the bottom-left of the card "
+                             "(for example TLA and 58).")
+            return
+        self._typed = True
+        self._lookup_number(set_code, num)
+
+    def _lookup_number(self, set_code, num, fallback=None):
+        self._job += 1
+        token = self._job
+        self.msg_var.set(f"Looking up {set_code.upper()} #{num}...")
+        self._bg(lambda: card_by_set_number(set_code, num),
+                 lambda ok, val: self._on_number(token, ok, val, set_code, num, fallback))
+
+    def _on_number(self, token, ok, val, set_code, num, fallback):
+        if token != self._job:
+            return
+        if not ok:
+            self._explain_failure(val)
+            return
+        if not val:
+            if fallback:
+                self.load_printings(fallback)
+            else:
+                self.msg_var.set(f"No card found for {set_code.upper()} #{num}. Check the set code "
+                                 "(3-4 letters) and number at the bottom-left of the card.")
+            return
+        self.matches = [val]
+        self.loaded_name = val["name"]
+        self.name_var.set(val["name"])
+        self._fill_printings(self.matches)
+        self.tree.selection_set("0")
+        self.msg_var.set(f"Found {val['name']} - {val['set']} #{val['number']}.")
 
     def load_printings(self, name):
         self.loaded_name = name
@@ -1234,24 +1736,27 @@ class AddCardDialog(tk.Toplevel):
         self._bg(lambda: search_mtg(name),
                  lambda ok, val: self._on_printings(token, ok, val))
 
+    def _explain_failure(self, err):
+        self.matches = []
+        self.loaded_name = ""
+        if isinstance(err, ScryfallBusy):
+            self.msg_var.set(f"Scryfall asked us to slow down. Wait about {err.seconds} "
+                             "seconds, then try again.")
+        else:
+            self.msg_var.set("Couldn't reach Scryfall - check your internet connection. "
+                             "You can still add the card with a custom value.")
+
     def _on_printings(self, token, ok, val):
         if token != self._job:
             return
         if not ok:
-            self.matches = []
-            self.loaded_name = ""
-            if isinstance(val, ScryfallBusy):
-                self.msg_var.set(f"Scryfall asked us to slow down. Wait about {val.seconds} "
-                                 "seconds, then press Search.")
-            else:
-                self.msg_var.set("Couldn't reach Scryfall - check your internet connection. "
-                                 "You can still add the card with a custom value.")
+            self._explain_failure(val)
             return
         self.matches = val
         self._fill_printings(val)
         if not val:
-            self.msg_var.set("No card found with that name - check the spelling, "
-                             "or add it with a custom value.")
+            self.msg_var.set("No card found with that name - check the spelling, use the "
+                             "set code and number, or add it with a custom value.")
             return
         self.msg_var.set(f"{len(val)} printing(s) found. Pick the one you have.")
         self.tree.selection_set("0")
@@ -1278,13 +1783,26 @@ class AddCardDialog(tk.Toplevel):
     def _fill_printings(self, matches):
         self.tree.delete(*self.tree.get_children())
         for i, m in enumerate(matches):
-            nf = f"${m['price_nonfoil']:,.2f}" if m["price_nonfoil"] else "n/a"
-            fo = f"${m['price_foil']:,.2f}" if m["price_foil"] else "n/a"
+            nf = money(m["price_nonfoil"]) if m["price_nonfoil"] else "n/a"
+            fo = money(m["price_foil"]) if m["price_foil"] else "n/a"
             self.tree.insert("", "end", iid=str(i),
                              values=(m["set"], m["number"], m["rarity"], nf, fo))
 
     # --------------------------------------------------------------------- add
+    def _quantity(self):
+        try:
+            q = int(self.qty_var.get().strip() or "1")
+            if 1 <= q <= 999:
+                return q
+        except ValueError:
+            pass
+        messagebox.showerror(APP_NAME, "Quantity must be a whole number from 1 to 999.", parent=self)
+        return None
+
     def add(self):
+        qty = self._quantity()
+        if qty is None:
+            return
         sel = self.tree.selection()
         custom = self.value_var.get().strip().replace("$", "")
         if sel and self.matches:
@@ -1308,7 +1826,59 @@ class AddCardDialog(tk.Toplevel):
             card["price_nonfoil"] = v
             card["price_foil"] = v
         apply_finish(card, self.finish_var.get())
+        card["qty"] = qty
         self.result = card
+        self.destroy()
+
+
+# ------------------------------------------------------------- phone window
+class PhoneWindow(tk.Toplevel):
+    """Shows the QR code to scan with a phone. Closing it turns the link off."""
+
+    def __init__(self, parent, link, on_close):
+        super().__init__(parent)
+        self.configure(bg=C["bg"])
+        self.title("Scan with your phone")
+        self.resizable(False, False)
+        self.link = link
+        self.on_close_cb = on_close
+        self.status_var = tk.StringVar(value="Waiting for your phone...")
+        body = ttk.Frame(self, padding=20)
+        body.pack()
+        ttk.Label(body, text="Scan with your phone", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(body, style="Muted.TLabel", justify="left", wraplength=360, text=(
+            "1. Connect your phone to the same Wi-Fi as this computer.\n"
+            "2. Point your phone's camera at this code and open the link.\n"
+            "3. Tap Take a photo. It appears here for you to confirm.")).pack(anchor="w", pady=(6, 12))
+        qr = make_qr_image(link.url)
+        panel = ttk.Frame(body, style="Panel.TFrame", padding=14)
+        panel.pack()
+        if qr is not None:
+            qr.thumbnail((300, 300), Image.NEAREST)
+            self._qr = ImageTk.PhotoImage(qr)
+            ttk.Label(panel, image=self._qr, style="Panel.TLabel").pack()
+        else:
+            ttk.Label(panel, text="(Couldn't draw the QR code - type the address\nbelow into your phone's browser.)",
+                      style="PanelMuted.TLabel", justify="center").pack()
+        addr = ttk.Entry(body, width=44)
+        addr.insert(0, link.url)
+        addr.configure(state="readonly")
+        addr.pack(fill="x", pady=(12, 4))
+        ttk.Label(body, style="Muted.TLabel", justify="left", wraplength=360, text=(
+            "If Windows asks about the firewall, choose Allow (private networks). "
+            "The link only works while this window is open, and only for people "
+            "with this exact address.")).pack(anchor="w", pady=(0, 8))
+        ttk.Label(body, textvariable=self.status_var, style="Section.TLabel").pack(anchor="w")
+        ttk.Button(body, text="Stop phone link", command=self.close).pack(anchor="e", pady=(10, 0))
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        center_on(self, parent)
+
+    def set_count(self, n):
+        if n:
+            self.status_var.set(f"Photos received: {n}. Keep sending - each one asks you to confirm.")
+
+    def close(self):
+        self.on_close_cb()
         self.destroy()
 
 
@@ -1317,16 +1887,22 @@ class ScannerApp:
     def __init__(self, root):
         self.root = root
         root.title(APP_NAME)
-        root.geometry("1380x800")
-        root.minsize(1240, 720)
+        try:
+            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+            root.geometry(f"{min(1440, sw - 40)}x{min(840, sh - 90)}+20+20")
+        except (tk.TclError, TypeError):
+            root.geometry("1380x800")
+        root.minsize(1180, 640)
         ensure_dirs()
         apply_theme(root)
+        start_ocr_warmup()                 # everything slow loads in the background
         self.settings = load_json(SETTINGS_FILE, {})
         self.cards = load_cards()
         self.catalog = NameCatalog(NAMES_FILE)
         self.catalog.start()
 
         self.finish = tk.StringVar(value=self.settings.get("finish", "nonfoil"))
+        self.mode_var = tk.StringVar(value=self.settings.get("mode", "manual"))
         self.camera_var = tk.StringVar(value=str(self.settings.get("camera_index", 0)))
         self.res_var = tk.StringVar(value=self.settings.get("resolution", RESOLUTIONS[0][0]))
         self.autofocus = tk.BooleanVar(value=bool(self.settings.get("autofocus", True)))
@@ -1338,19 +1914,27 @@ class ScannerApp:
         self.status_var = tk.StringVar(value=f"Your cards are saved in: {DATA_DIR}")
         self.detail_var = tk.StringVar()
 
-        self.cap = None
+        self.stream = None
         self.last_frame = None
         self.photo = None
         self.busy = False
         self.quad = None
         self.quad_miss = 0
+        self.quad_motion = 999.0
         self.frame_count = 0
         self.sharp_avg = 0.0
         self.frame_buffer = deque(maxlen=6)   # recent (sharpness, frame, quad)
         self._pill_state = None
+        self._seen_seq = -1
+        self._opened_cam_settings = False
+        self.auto_hold = 0                    # auto mode bookkeeping
+        self.auto_armed = True
+        self.auto_gone = 0
+        self.phone = None
+        self.phone_window = None
 
         self.build_ui()
-        self.open_camera()
+        self.start_camera()
         self.refresh_table()
         self.update_preview()
         root.bind("<space>", self.on_space)
@@ -1365,7 +1949,7 @@ class ScannerApp:
         root.rowconfigure(1, weight=1)
 
         # ---- header
-        head = ttk.Frame(root, padding=(22, 16, 22, 6))
+        head = ttk.Frame(root, padding=(22, 14, 22, 4))
         head.grid(row=0, column=0, columnspan=2, sticky="ew")
         head.columnconfigure(0, weight=1)
         titles = ttk.Frame(head)
@@ -1382,7 +1966,7 @@ class ScannerApp:
             t.pack(side="left", padx=(8, 0))
 
         # ---- left: camera
-        left = ttk.Frame(root, padding=(22, 8, 10, 16))
+        left = ttk.Frame(root, padding=(22, 8, 10, 12))
         left.grid(row=1, column=0, sticky="nsw")
         cam = ttk.Frame(left, style="Panel.TFrame", padding=14)
         cam.pack(fill="x")
@@ -1402,25 +1986,28 @@ class ScannerApp:
         ttk.Label(pill_row, textvariable=self.detail_var,
                   style="PanelMuted.TLabel").pack(side="right")
 
+        ttk.Button(cam, text="Snap card   (Space)", style="Accent.TButton",
+                   command=self.snap, takefocus=0).pack(fill="x", pady=(12, 0))
         row = ttk.Frame(cam, style="Panel.TFrame")
-        row.pack(fill="x", pady=(12, 0))
-        ttk.Button(row, text="Snap card   (Space)", style="Accent.TButton",
-                   command=self.snap, takefocus=0).pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Photo file...", command=self.scan_file,
-                   takefocus=0).pack(side="left", padx=(8, 0), ipady=3)
-        ttk.Button(row, text="Add by name...", command=self.add_by_name,
-                   takefocus=0).pack(side="left", padx=(8, 0), ipady=3)
+        row.pack(fill="x", pady=(8, 0))
+        for text, cmd in (("Phone...", self.open_phone), ("Photo file...", self.scan_file),
+                          ("Add by name / number...", self.add_by_name)):
+            ttk.Button(row, text=text, command=cmd, takefocus=0).pack(
+                side="left", fill="x", expand=True, padx=(0, 6))
 
-        fin = ttk.Frame(cam, style="Panel.TFrame")
-        fin.pack(fill="x", pady=(12, 0))
-        ttk.Label(fin, text="New scans are", style="PanelMuted.TLabel").pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(fin, text="Non-foil", value="nonfoil", variable=self.finish,
-                        style="Seg.Toolbutton", command=self.on_finish_change,
-                        takefocus=0).pack(side="left")
-        ttk.Radiobutton(fin, text="Foil", value="foil", variable=self.finish,
-                        style="Seg.Toolbutton", command=self.on_finish_change,
-                        takefocus=0).pack(side="left", padx=(2, 0))
-        self.cam_toggle = ttk.Button(fin, text="Camera settings  v", style="Link.TButton",
+        opt = ttk.Frame(cam, style="Panel.TFrame")
+        opt.pack(fill="x", pady=(12, 0))
+        ttk.Label(opt, text="Capture", style="PanelMuted.TLabel").pack(side="left", padx=(0, 8))
+        for text, val in (("Manual", "manual"), ("Auto", "auto")):
+            ttk.Radiobutton(opt, text=text, value=val, variable=self.mode_var,
+                            style="Seg.Toolbutton", command=self.on_mode_change,
+                            takefocus=0).pack(side="left", padx=(0, 2))
+        ttk.Label(opt, text="   New scans are", style="PanelMuted.TLabel").pack(side="left", padx=(0, 8))
+        for text, val in (("Non-foil", "nonfoil"), ("Foil", "foil")):
+            ttk.Radiobutton(opt, text=text, value=val, variable=self.finish,
+                            style="Seg.Toolbutton", command=self.on_finish_change,
+                            takefocus=0).pack(side="left", padx=(0, 2))
+        self.cam_toggle = ttk.Button(opt, text="Camera  v", style="Link.TButton",
                                      command=self.toggle_camera_settings, takefocus=0)
         self.cam_toggle.pack(side="right")
 
@@ -1455,12 +2042,12 @@ class ScannerApp:
 
         ttk.Label(left, justify="left", style="Muted.TLabel", wraplength=PREVIEW_W, text=(
             "Tips: fill the frame with the card, hold it flat and steady, and keep light "
-            "on it without glare. A brighter room helps more than anything else. "
-            "Still struggling? Take a photo with your phone and use Photo file...")
-                  ).pack(anchor="w", pady=(12, 0))
+            "on it without glare. In Auto mode the app snaps when the card is sharp and "
+            "still, then asks you to confirm - remove the card to scan the next one.")
+                  ).pack(anchor="w", pady=(10, 0))
 
         # ---- right: collection
-        right = ttk.Frame(root, padding=(10, 8, 22, 16))
+        right = ttk.Frame(root, padding=(10, 8, 22, 12))
         right.grid(row=1, column=1, sticky="nsew")
         panel = ttk.Frame(right, style="Panel.TFrame", padding=14)
         panel.pack(fill="both", expand=True)
@@ -1470,18 +2057,18 @@ class ScannerApp:
         bar = ttk.Frame(panel, style="Panel.TFrame")
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         for label, var, values, width in (
-                ("Type", self.type_var, TYPE_FILTERS, 12),
-                ("Color", self.color_var, COLOR_FILTERS, 11),
-                ("Sort", self.sort_var, [n for n, _ in SORT_MODES], 18)):
+                ("Type", self.type_var, TYPE_FILTERS, 11),
+                ("Color", self.color_var, COLOR_FILTERS, 10),
+                ("Sort", self.sort_var, [n for n, _ in SORT_MODES], 19)):
             ttk.Label(bar, text=label, style="PanelMuted.TLabel").pack(side="left", padx=(0, 6))
             c = ttk.Combobox(bar, textvariable=var, values=values, width=width,
                              state="readonly")
-            c.pack(side="left", padx=(0, 16))
+            c.pack(side="left", padx=(0, 14))
             c.bind("<<ComboboxSelected>>", self.on_filter_change)
 
-        cols = [("name", "Name", 210, "w"), ("type", "Type", 90, "w"),
-                ("color", "Color", 90, "w"), ("set", "Set", 170, "w"),
-                ("finish", "Finish", 75, "w"), ("value", "Value", 80, "e")]
+        cols = [("qty", "Qty", 42, "e"), ("name", "Name", 180, "w"), ("type", "Type", 80, "w"),
+                ("color", "Color", 78, "w"), ("set", "Set", 140, "w"),
+                ("finish", "Finish", 66, "w"), ("each", "Each", 62, "e"), ("value", "Total", 72, "e")]
         tframe = ttk.Frame(panel, style="Panel.TFrame")
         tframe.grid(row=1, column=0, sticky="nsew")
         tframe.columnconfigure(0, weight=1)
@@ -1490,7 +2077,7 @@ class ScannerApp:
                                  selectmode="extended")
         for key, text, width, anchor in cols:
             self.tree.heading(key, text=text, anchor=anchor)
-            self.tree.column(key, width=width, anchor=anchor)
+            self.tree.column(key, width=width, anchor=anchor, stretch=(key in ("name", "set")))
         self.tree.tag_configure("odd", background=C["stripe"])
         self.tree.tag_configure("foil", foreground=C["gold"])
         sb = ttk.Scrollbar(tframe, orient="vertical", command=self.tree.yview)
@@ -1501,13 +2088,15 @@ class ScannerApp:
 
         btns = ttk.Frame(panel, style="Panel.TFrame")
         btns.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        for text, cmd, style in (("Switch foil / non-foil", self.flip_selected, "TButton"),
-                                 ("Remove selected", self.remove_selected, "Danger.TButton"),
-                                 ("Export this view", self.export_view, "TButton"),
+        for text, cmd, style in (("+1", lambda: self.change_qty(1), "Small.TButton"),
+                                 ("-1", lambda: self.change_qty(-1), "Small.TButton"),
+                                 ("Switch foil", self.flip_selected, "TButton"),
+                                 ("Remove", self.remove_selected, "Danger.TButton"),
+                                 ("Export view", self.export_view, "TButton"),
                                  ("Export all", self.export_all, "TButton"),
-                                 ("Open my files", lambda: open_folder(DATA_DIR), "TButton")):
+                                 ("My files", lambda: open_folder(DATA_DIR), "TButton")):
             ttk.Button(btns, text=text, command=cmd, style=style,
-                       takefocus=0).pack(side="left", padx=(0, 8))
+                       takefocus=0).pack(side="left", padx=(0, 6))
 
         tk.Label(root, textvariable=self.status_var, anchor="w", bg=C["panel"],
                  fg=C["muted"], font=F(9), padx=22, pady=6).grid(
@@ -1516,44 +2105,22 @@ class ScannerApp:
     def toggle_camera_settings(self):
         if self.cam_frame.winfo_ismapped():
             self.cam_frame.pack_forget()
-            self.cam_toggle.configure(text="Camera settings  v")
+            self.cam_toggle.configure(text="Camera  v")
         else:
             self.cam_frame.pack(fill="x")
-            self.cam_toggle.configure(text="Camera settings  ^")
+            self.cam_toggle.configure(text="Camera  ^")
 
     # ------------------------------------------------------------ camera
-    def _try_open(self, idx):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(idx)
-        if cap is not None and cap.isOpened():
-            return cap
-        if cap is not None:
-            cap.release()
-        return None
-
-    def open_camera(self):
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+    def start_camera(self):
+        if self.stream is not None:
+            self.stream.stop()
+        _, rw, rh = next((r for r in RESOLUTIONS if r[0] == self.res_var.get()), RESOLUTIONS[0])
+        self.stream = CameraStream(int(self.camera_var.get()), rw, rh,
+                                   bool(self.autofocus.get()), float(self.focus_value.get()))
         self.last_frame = None
         self.quad = None
+        self._seen_seq = -1
         self.frame_buffer.clear()
-        wanted = int(self.camera_var.get())
-        cap = self._try_open(wanted)
-        if cap is None:                       # try the other camera numbers too
-            for idx in range(4):
-                if idx != wanted:
-                    cap = self._try_open(idx)
-                    if cap is not None:
-                        self.camera_var.set(str(idx))
-                        break
-        if cap is None:
-            self.cap = None
-            return
-        _, rw, rh = next((r for r in RESOLUTIONS if r[0] == self.res_var.get()), RESOLUTIONS[0])
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
-        self.cap = cap
         self.apply_focus()
 
     def update_preview(self):
@@ -1563,30 +2130,47 @@ class ScannerApp:
             print("preview error:", e, file=sys.stderr)
         self.root.after(33, self.update_preview)
 
+    def _show_message(self, text, pill_text):
+        self.canvas.itemconfig(self.img_item, image="")
+        self.canvas.itemconfig(self.msg_item, state="normal", text=text)
+        self.set_pill("warn" if "found" in pill_text or "lost" in pill_text else "idle", pill_text)
+        self.detail_var.set("")
+
     def _update_preview_once(self):
-        frame = None
-        if self.cap is not None:
-            ok, f = self.cap.read()
-            if ok:
-                frame = f
-        if frame is None:
+        st = self.stream.state
+        if st == "opening":
             self.last_frame = None
-            self.canvas.itemconfig(self.img_item, image="")
-            self.canvas.itemconfig(
-                self.msg_item, state="normal",
-                text="No camera found.\nMake sure it's plugged in and not being used by "
-                     "another app, then open Camera settings and try another camera number. "
-                     "You can still use Photo file... or Add by name...")
-            self.set_pill("warn", "No camera found")
-            self.detail_var.set("")
+            self._show_message("Starting camera...", "Starting camera...")
             return
+        if st in ("none", "lost"):
+            self.last_frame = None
+            if st == "none":
+                self._show_message(
+                    "No camera found.\nMake sure it's plugged in and not being used by another "
+                    "app, then open Camera and try another camera number. You can still use "
+                    "Phone..., Photo file... or Add by name / number...", "No camera found")
+            else:
+                self._show_message("The camera stopped sending pictures. Unplug it and plug it "
+                                   "back in, then choose its number under Camera.", "Camera lost")
+            if not self._opened_cam_settings:
+                self._opened_cam_settings = True
+                if not self.cam_frame.winfo_ismapped():
+                    self.toggle_camera_settings()
+            return
+        frame, seq = self.stream.latest()
+        if frame is None or seq == self._seen_seq:
+            return                                   # nothing new to draw
+        self._seen_seq = seq
+        if str(self.stream.index) != self.camera_var.get():
+            self.camera_var.set(str(self.stream.index))
 
         self.last_frame = frame
         self.frame_count += 1
         if self.frame_count % 3 == 0:                     # look for the card outline
             q = detect_card(frame)
             if q is not None:
-                if self.quad is not None and np.abs(self.quad - q).max() < 40:
+                self.quad_motion = float(np.abs(self.quad - q).max()) if self.quad is not None else 999.0
+                if self.quad is not None and self.quad_motion < 40:
                     q = 0.5 * self.quad + 0.5 * q          # smooth the jitter
                 self.quad, self.quad_miss = q.astype("float32"), 0
             else:
@@ -1601,6 +2185,8 @@ class ScannerApp:
         self.frame_buffer.append((sharp, frame, self.quad))
 
         state, text = self.assess(frame, bright)
+        if self.mode_var.get() == "auto" and not self.busy:
+            state, text = self.auto_step(frame, state, text)
         self.set_pill(state, text)
         if self.frame_count % 5 == 0:
             self.detail_var.set(f"focus {self.sharp_avg:.0f}   light {bright:.0f}")
@@ -1627,6 +2213,32 @@ class ScannerApp:
         if self.sharp_avg < 45:
             return "warn", "Blurry - hold steady or adjust focus"
         return "good", "Ready - press Space"
+
+    def auto_step(self, frame, state, text):
+        """Auto mode: when the card is ready AND still for a moment, capture it.
+        The confirm window still opens, so nothing is added without your OK."""
+        if self.quad is None:
+            self.auto_hold = 0
+            self.auto_gone += 1
+            if self.auto_gone >= 8:
+                self.auto_armed = True
+            return "idle", "Auto: place a card in the frame"
+        self.auto_gone = 0
+        if not self.auto_armed:
+            return "idle", "Remove the card to scan the next one (or press Space)"
+        if state != "good":
+            self.auto_hold = 0
+            return state, text
+        if self.quad_motion > max(6.0, frame.shape[1] * 0.006):
+            self.auto_hold = 0
+            return "warn", "Hold still..."
+        self.auto_hold += 1
+        if self.auto_hold >= AUTO_HOLD_FRAMES:
+            self.auto_hold = 0
+            self.auto_armed = False                 # one scan per card placement
+            self.root.after(10, self.snap)
+            return "good", "Captured!"
+        return "good", f"Hold still...  {int(100 * self.auto_hold / AUTO_HOLD_FRAMES)}%"
 
     def set_pill(self, state, text):
         if (state, text) == self._pill_state:
@@ -1663,6 +2275,15 @@ class ScannerApp:
         self.snap()
         return "break"
 
+    def on_mode_change(self):
+        self.settings["mode"] = self.mode_var.get()
+        save_json(SETTINGS_FILE, self.settings)
+        self.auto_hold = 0
+        self.auto_armed = True
+        self.set_status("Auto mode: hold a card still in the frame and it is captured for you "
+                        "to confirm." if self.mode_var.get() == "auto" else "Manual mode: press Space to snap.")
+        self.canvas.focus_set()
+
     def on_finish_change(self):
         self.settings["finish"] = self.finish.get()
         save_json(SETTINGS_FILE, self.settings)
@@ -1674,7 +2295,7 @@ class ScannerApp:
         self.settings["camera_index"] = int(self.camera_var.get())
         self.settings["resolution"] = self.res_var.get()
         save_json(SETTINGS_FILE, self.settings)
-        self.open_camera()
+        self.start_camera()
         self.canvas.focus_set()
 
     def on_debug_change(self):
@@ -1686,14 +2307,8 @@ class ScannerApp:
     def apply_focus(self):
         auto = self.autofocus.get()
         self.focus_scale.state(["disabled"] if auto else ["!disabled"])
-        if self.cap is None:
-            return
-        try:  # not every camera supports these; failures are harmless
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if auto else 0)
-            if not auto:
-                self.cap.set(cv2.CAP_PROP_FOCUS, float(self.focus_value.get()))
-        except Exception:
-            pass
+        if self.stream is not None:
+            self.stream.send("focus", auto, float(self.focus_value.get()))
 
     def on_focus_change(self):
         self.settings["autofocus"] = bool(self.autofocus.get())
@@ -1704,15 +2319,11 @@ class ScannerApp:
 
     def open_driver_settings(self):
         """Opens the camera maker's own settings window (focus, brightness...)."""
-        if self.cap is None:
+        if self.stream is None or self.stream.state != "live":
             messagebox.showinfo(APP_NAME, "The camera isn't working yet.")
             return
-        try:
-            self.cap.set(cv2.CAP_PROP_SETTINGS, 1)
-            self.set_status("Opened the camera's own settings window "
-                            "(it may appear behind this window).")
-        except Exception:
-            messagebox.showinfo(APP_NAME, "This camera doesn't offer a settings window.")
+        self.stream.send("settings")
+        self.set_status("Opened the camera's own settings window (it may appear behind this window).")
 
     def on_filter_change(self, event=None):
         self.refresh_table()
@@ -1736,15 +2347,16 @@ class ScannerApp:
             if c["finish"] == "foil":
                 tags.append("foil")
             self.tree.insert("", "end", iid=c["id"], tags=tags, values=(
-                c["name"], main_type(c), color_text(c), c["set"],
-                finish_text(c), f"${c['price']:,.2f}"))
+                c["qty"], c["name"], main_type(c), color_text(c), c["set"],
+                finish_text(c), money(c["price"]), money(line_total(c))))
         keep = [i for i in keep_selection if self.tree.exists(i)]
         if keep:
             self.tree.selection_set(keep)
-        total = len(self.cards)
-        self.tile_count.set(f"{len(view)}" if len(view) == total else f"{len(view)} of {total}")
-        self.tile_view.set(f"${sum(c['price'] for c in view):,.2f}")
-        self.tile_all.set(f"${sum(c['price'] for c in self.cards):,.2f}")
+        shown = sum(c["qty"] for c in view)
+        total = sum(c["qty"] for c in self.cards)
+        self.tile_count.set(f"{shown}" if shown == total else f"{shown} of {total}")
+        self.tile_view.set(money(sum(line_total(c) for c in view)))
+        self.tile_all.set(money(sum(line_total(c) for c in self.cards)))
 
     def selected_cards(self):
         ids = set(self.tree.selection())
@@ -1753,13 +2365,14 @@ class ScannerApp:
     def save_cards(self):
         save_json(CARDS_FILE, self.cards)
 
-    # ---------------------------------------------------------- snapping
+    # ---------------------------------------------------------- adding cards
     def snap(self):
         if self.busy:
             return
         if self.last_frame is None or not self.frame_buffer:
             messagebox.showinfo(APP_NAME, "The camera isn't working yet, so there's nothing "
-                                "to snap. You can use Photo file... or Add by name... instead.")
+                                "to snap. You can use Phone..., Photo file... or Add by name / "
+                                "number... instead.")
             return
         best = sorted(self.frame_buffer, key=lambda t: -t[0])[:3]   # sharpest frames first
         cards = [extract_card(frame, quad) for _, frame, quad in best]
@@ -1787,6 +2400,7 @@ class ScannerApp:
             self.run_add_dialog([])
 
     def run_add_dialog(self, cards):
+        """Open the confirm window. Returns the card as stored (or None if cancelled)."""
         self.busy = True
         try:
             dlg = AddCardDialog(self.root, cards, self.catalog, self.finish.get(),
@@ -1795,9 +2409,15 @@ class ScannerApp:
             card = dlg.result
         finally:
             self.busy = False
+            self.auto_armed = False        # auto mode waits until the card is taken away
+            self.auto_hold = 0
+        try:
+            self.canvas.focus_set()
+        except tk.TclError:
+            pass
         if not card:
             self.set_status("Cancelled - nothing added.")
-            return
+            return None
 
         card["id"] = f"c{time.time_ns()}"
         card["scanned_at"] = time.time()
@@ -1810,12 +2430,48 @@ class ScannerApp:
                 card["image"] = fname
             except OSError:
                 pass
-        self.cards.append(card)
+        stored = self.add_to_collection(card)
         self.save_cards()
         self.refresh_table()
-        self.set_status(f"Added {card['name']} ({finish_text(card)}) - ${card['price']:,.2f}")
+        self.set_status(
+            f"Added {card['qty']}x {card['name']} ({finish_text(card)}) - {money(card['price'])} each"
+            + (f".  You now have {stored['qty']}." if stored is not card else "."))
+        return stored
+
+    def add_to_collection(self, card):
+        """Scanning the same printing again adds to its quantity instead of a new row."""
+        for c in self.cards:
+            if same_card(c, card):
+                c["qty"] += card["qty"]
+                c["price_nonfoil"], c["price_foil"] = card["price_nonfoil"], card["price_foil"]
+                apply_finish(c, c["finish"])           # refresh the price
+                return c
+        self.cards.append(card)
+        return card
 
     # ------------------------------------------------------- list actions
+    def change_qty(self, delta):
+        sel = self.selected_cards()
+        if not sel:
+            messagebox.showinfo(APP_NAME, "Click a card in the list first "
+                                "(hold Ctrl to pick several).")
+            return
+        ids = [c["id"] for c in sel]
+        gone = [c for c in sel if c["qty"] + delta < 1]
+        if gone and not messagebox.askyesno(
+                APP_NAME, f"{len(gone)} card(s) would drop to zero. Remove them from your list?"):
+            sel = [c for c in sel if c not in gone]
+            gone = []
+        for c in sel:
+            if c in gone:
+                continue
+            c["qty"] += delta
+        if gone:
+            drop = {c["id"] for c in gone}
+            self.cards = [c for c in self.cards if c["id"] not in drop]
+        self.save_cards()
+        self.refresh_table(keep_selection=ids)
+
     def flip_selected(self):
         sel = self.selected_cards()
         if not sel:
@@ -1849,6 +2505,61 @@ class ScannerApp:
         self.refresh_table()
         self.set_status(f"Removed {len(sel)} card(s).")
 
+    # ------------------------------------------------------------- phone
+    def open_phone(self):
+        if self.phone_window is not None:
+            try:
+                self.phone_window.lift()
+                return
+            except tk.TclError:
+                self.phone_window = None
+        link = PhoneLink()
+        try:
+            link.start()
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't start the phone link:\n{e}")
+            return
+        self.phone = link
+        self.phone_window = PhoneWindow(self.root, link, self.close_phone)
+        self.root.after(400, self.process_phone)
+
+    def close_phone(self):
+        if self.phone is not None:
+            self.phone.stop()
+        self.phone = None
+        self.phone_window = None
+
+    def process_phone(self):
+        link = self.phone
+        if link is None:
+            return
+        try:
+            if self.phone_window is not None:
+                self.phone_window.set_count(link.received)
+            if not self.busy and not link.incoming.empty():
+                job, img = link.incoming.get_nowait()
+                self.bring_to_front()
+                self.handle_phone_photo(link, job, img)
+        finally:
+            if self.phone is not None:
+                self.root.after(400, self.process_phone)
+
+    def handle_phone_photo(self, link, job, img):
+        card = self.run_add_dialog([extract_card(img, None, frac=1.0)])
+        if card:
+            link.set_status(job, "added", f"{card['name']} - {money(card['price'])}")
+        else:
+            link.set_status(job, "skipped")
+
+    def bring_to_front(self):
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(400, lambda: self.root.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+
     # ------------------------------------------------------------ export
     def _export(self, rows, header_lines, label):
         if not rows:
@@ -1866,7 +2577,7 @@ class ScannerApp:
         except OSError as e:
             messagebox.showerror(APP_NAME, f"Couldn't save the file:\n{e}")
             return
-        self.set_status(f"Saved {len(rows)} cards to {path}")
+        self.set_status(f"Saved {len(rows)} lines to {path}")
 
     def export_view(self):
         self._export(self.current_view(), [
@@ -1883,8 +2594,9 @@ class ScannerApp:
 
     # -------------------------------------------------------------- close
     def on_close(self):
-        if self.cap is not None:
-            self.cap.release()
+        if self.stream is not None:
+            self.stream.stop()
+        self.close_phone()
         self.root.destroy()
 
 
