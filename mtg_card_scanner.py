@@ -1178,55 +1178,155 @@ class CameraStream:
 # -------------------------------------------------------------- phone link
 PHONE_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>MTG Card Scanner</title>
 <style>
  :root{color-scheme:dark}
- body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#13151b;color:#e9ebf2;padding:22px;text-align:center}
- h1{font-size:22px;margin:8px 0 4px}
- p{color:#8f96a8;line-height:1.45;margin:6px 0 18px}
- label.btn{display:block;background:#6d8bff;color:#fff;font-weight:700;font-size:20px;padding:20px;border-radius:14px;margin:12px 0}
- label.alt{background:#252938;font-size:16px;padding:14px;font-weight:600;color:#c8cddc}
- img{max-width:100%;max-height:42vh;border-radius:10px;margin:10px 0}
- #msg{font-size:18px;min-height:28px;margin-top:8px}
+ *{box-sizing:border-box}
+ body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#13151b;color:#e9ebf2;text-align:center}
+ .wrap{padding:14px 16px 24px;max-width:560px;margin:0 auto}
+ h1{font-size:20px;margin:6px 0 2px}
+ p{color:#8f96a8;line-height:1.4;margin:6px 0 12px;font-size:15px}
+ #stage{position:relative;background:#000;border-radius:14px;overflow:hidden;display:none}
+ video{width:100%;display:block;max-height:68vh;object-fit:cover}
+ #guide{position:absolute;border:3px solid #e1e1e1;border-radius:10px;pointer-events:none;transition:border-color .15s}
+ #pill{position:absolute;left:10px;right:10px;bottom:10px;padding:8px 10px;border-radius:999px;background:#252938;color:#c8cddc;font-weight:700;font-size:15px}
+ #pill.good{background:#38d996;color:#0d1117}#pill.warn{background:#ffb547;color:#0d1117}
+ button,label.btn{display:block;width:100%;border:0;background:#6d8bff;color:#fff;font-weight:700;font-size:18px;padding:16px;border-radius:14px;margin:10px 0;font-family:inherit}
+ .alt{background:#252938!important;color:#c8cddc!important;font-size:15px!important;padding:12px!important;font-weight:600!important}
+ #msg{font-size:17px;min-height:26px;margin:8px 0}
  .ok{color:#38d996}.warn{color:#ffb547}
-</style></head><body>
+ #sent{max-width:60%;max-height:20vh;border-radius:8px;margin:4px auto;display:none}
+</style></head><body><div class="wrap">
 <h1>MTG Card Scanner</h1>
-<p>Fill the frame with one card, hold steady, and make sure it is well lit.
-Each photo is sent to your computer, where you confirm it.</p>
-<label class="btn">Take a photo<input id="cam" type="file" accept="image/*" capture="environment" hidden></label>
-<label class="btn alt">Choose a saved photo<input id="pick" type="file" accept="image/*" hidden></label>
-<img id="pv" alt="" hidden>
+<p id="intro">Starting the camera...</p>
+<div id="stage"><video id="v" playsinline muted autoplay></video><div id="guide"></div><div id="pill">Starting...</div></div>
+<button id="now" class="alt" style="display:none">Send now</button>
 <div id="msg"></div>
+<img id="sent" alt="">
+<label class="btn alt">Take a photo with the camera app<input id="cam" type="file" accept="image/*" capture="environment" hidden></label>
+<label class="btn alt">Choose a saved photo<input id="pick" type="file" accept="image/*" hidden></label>
+</div>
+<canvas id="c" width="96" height="96" hidden></canvas>
 <script>
 const base = location.pathname.replace(/\/?$/, "/");
-const msg = document.getElementById("msg"), pv = document.getElementById("pv");
+const $ = id => document.getElementById(id);
+const msg = $("msg"), pill = $("pill"), guide = $("guide"), video = $("v");
 function say(t, cls){ msg.textContent = t; msg.className = cls || ""; }
-async function send(file){
-  if(!file) return;
-  pv.src = URL.createObjectURL(file); pv.hidden = false;
+function setPill(t, cls){ pill.textContent = t; pill.className = cls || ""; guide.style.borderColor = cls === "good" ? "#38d996" : cls === "warn" ? "#ffb547" : "#e1e1e1"; }
+
+let busy = false;            // a card is waiting for your OK on the computer
+async function upload(blob, live, thumb){
+  busy = true;
+  if(thumb){ $("sent").src = thumb; $("sent").style.display = "block"; }
   say("Sending...");
   try{
-    const r = await fetch(base + "upload", {method: "POST", body: file});
+    const r = await fetch(base + "upload?live=" + (live ? 1 : 0), {method: "POST", body: blob});
     const j = await r.json();
     if(!r.ok) throw new Error(j.error || "upload failed");
     say("Sent! Confirm it on the computer.", "ok");
     poll(j.id);
-  }catch(e){ say("Couldn't send: " + e.message, "warn"); }
+  }catch(e){ say("Couldn't send: " + e.message, "warn"); busy = false; }
 }
 async function poll(id){
-  for(let i = 0; i < 600; i++){
-    await new Promise(r => setTimeout(r, 1200));
+  for(let i = 0; i < 900; i++){
+    await new Promise(r => setTimeout(r, 1000));
     try{
       const j = await (await fetch(base + "status?id=" + id)).json();
-      if(j.state === "added"){ say("Added: " + j.text, "ok"); return; }
-      if(j.state === "skipped"){ say("Skipped. Take another photo when ready.", "warn"); return; }
+      if(j.state === "added"){ say("Added: " + j.text + "  - next card!", "ok"); done(); return; }
+      if(j.state === "skipped"){ say("Skipped. Show the next card.", "warn"); done(); return; }
     }catch(e){}
   }
+  done();
 }
-for(const id of ["cam", "pick"]){
-  document.getElementById(id).addEventListener("change", e => { send(e.target.files[0]); e.target.value = ""; });
+function done(){ busy = false; waitGone = true; goneCount = 0; still = 0; }
+function fileSend(f){ if(f){ upload(f, false, URL.createObjectURL(f)); } }
+for(const id of ["cam", "pick"]) $(id).addEventListener("change", e => { fileSend(e.target.files[0]); e.target.value = ""; });
+
+// ---------------- live camera: watches for a sharp, still card, then sends one frame
+const W = 96, H = 96, cv = $("c"), cx = cv.getContext("2d", {willReadFrequently: true});
+let prev = null, still = 0, bestSharp = 0, waitGone = false, goneCount = 0, refFrame = null, sharpHist = [];
+let g = {x: 0, y: 0, w: 1, h: 1};     // card-shaped guide in video pixels
+
+function layoutGuide(){
+  const vw = video.videoWidth, vh = video.videoHeight; if(!vw) return;
+  const bw0 = vh * 0.92 * 63 / 88, bw = Math.min(vw, bw0), bh = bw === bw0 ? vh * 0.92 : bw * 88 / 63;
+  g = {x: (vw - bw) / 2, y: (vh - bh) / 2, w: bw, h: bh};
+  const r = video.getBoundingClientRect(), s = Math.max(r.width / vw, r.height / vh);
+  const ox = (r.width - vw * s) / 2, oy = (r.height - vh * s) / 2;
+  Object.assign(guide.style, {left: (ox + g.x * s) + "px", top: (oy + g.y * s) + "px", width: (g.w * s) + "px", height: (g.h * s) + "px"});
 }
+function sample(){            // small grayscale picture of the guide area
+  cx.drawImage(video, g.x, g.y, g.w, g.h, 0, 0, W, H);
+  const d = cx.getImageData(0, 0, W, H).data, a = new Float32Array(W * H);
+  for(let i = 0; i < a.length; i++) a[i] = 0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2];
+  return a;
+}
+function analyze(a){
+  let lap = 0, edges = 0, n = 0;
+  for(let y = 1; y < H - 1; y++) for(let x = 1; x < W - 1; x++){
+    const i = y * W + x, l = 4 * a[i] - a[i-1] - a[i+1] - a[i-W] - a[i+W];
+    lap += l * l; n++;
+    if(Math.abs(a[i+1] - a[i-1]) + Math.abs(a[i+W] - a[i-W]) > 40) edges++;
+  }
+  return {sharp: lap / n, edge: edges / n};
+}
+function diff(a, b){ let s = 0; for(let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
+
+function grab(){ // full-resolution frame -> jpeg
+  const c = document.createElement("canvas"); c.width = video.videoWidth; c.height = video.videoHeight;
+  c.getContext("2d").drawImage(video, 0, 0);
+  return new Promise(res => c.toBlob(b => res({blob: b, thumb: c.toDataURL("image/jpeg", 0.3)}), "image/jpeg", 0.92));
+}
+async function sendNow(){
+  if(busy) return;
+  const f = await grab(); refFrame = sample();
+  upload(f.blob, true, f.thumb);
+}
+$("now").addEventListener("click", sendNow);
+
+function tick(){
+  if(!video.videoWidth) return;
+  layoutGuide();
+  const a = sample(), m = analyze(a);
+  sharpHist.push(m.sharp); if(sharpHist.length > 25) sharpHist.shift();
+  const best = Math.max(...sharpHist);
+  const moved = prev ? diff(a, prev) : 99; prev = a;
+  if(busy){ setPill("Waiting for you to confirm on the computer", ""); return; }
+  if(waitGone){
+    const changed = refFrame ? diff(a, refFrame) : 99;
+    goneCount = (changed > 14 || m.edge < 0.04) ? goneCount + 1 : 0;
+    if(goneCount >= 6){ waitGone = false; sharpHist = []; }
+    else { setPill("Remove the card to scan the next one", ""); return; }
+  }
+  if(m.edge < 0.07){ still = 0; setPill("Hold a card inside the frame", ""); return; }
+  if(moved > 5){ still = 0; setPill("Hold still...", "warn"); return; }
+  if(m.sharp < 0.85 * best || m.sharp < 25){ still = 0; setPill("Not sharp yet - hold steady", "warn"); return; }
+  still++;
+  setPill("Hold still...  " + Math.min(100, Math.round(still * 100 / 6)) + "%", "good");
+  if(still >= 6){ still = 0; setPill("Captured!", "good"); sendNow(); }
+}
+
+async function startCamera(){
+  if(!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    $("intro").textContent = "Live camera needs the secure link, so use the photo buttons below.";
+    return;
+  }
+  try{
+    const s = await navigator.mediaDevices.getUserMedia({audio: false, video: {
+      facingMode: {ideal: "environment"}, width: {ideal: 1920}, height: {ideal: 1080}}});
+    video.srcObject = s; await video.play();
+    $("stage").style.display = "block"; $("now").style.display = "block";
+    $("intro").textContent = "Put a card inside the frame and hold it still. It is sent automatically, and you confirm it on the computer.";
+    try{ const t = s.getVideoTracks()[0]; t.applyConstraints({advanced: [{focusMode: "continuous"}]}).catch(() => {}); }catch(e){}
+    try{ if(navigator.wakeLock) navigator.wakeLock.request("screen").catch(() => {}); }catch(e){}
+    setInterval(tick, 110);
+    document.addEventListener("visibilitychange", () => { if(!document.hidden && navigator.wakeLock) navigator.wakeLock.request("screen").catch(() => {}); });
+  }catch(e){
+    $("intro").textContent = "Couldn't open the camera (" + (e.name || "error") + "). Allow camera access for this page, or use the photo buttons below.";
+  }
+}
+startCamera();
 </script></body></html>
 """
 
@@ -1261,28 +1361,82 @@ def make_qr_image(text, box=8):
         return None
 
 
-class PhoneLink:
-    """A tiny web page served from this PC. A phone on the same Wi-Fi opens it
-    (via a QR code), takes a photo of a card, and the photo lands in `incoming`."""
-    MAX_BYTES = 25 * 1024 * 1024
+CERT_DIR = DATA_DIR / "PhoneCertificate"
 
-    def __init__(self):
+
+def ensure_certificate(ip, folder=None):
+    """A self-signed certificate (so the phone can use https and open its camera).
+    It is created once, kept in your files, and remade only if this PC's address changes.
+    Returns (certificate file, key file)."""
+    import ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    folder = Path(folder or CERT_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    crt, key, meta = folder / "cert.pem", folder / "key.pem", folder / "meta.json"
+    info = load_json(meta, {})
+    fresh = False
+    try:
+        fresh = (crt.exists() and key.exists() and info.get("ip") == ip
+                 and time.time() < float(info.get("expires", 0)))
+    except (TypeError, ValueError):
+        fresh = False
+    if fresh:
+        return crt, key
+    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MTG Card Scanner")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expires = now + datetime.timedelta(days=800)
+    sans = [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+    try:
+        sans.append(x509.IPAddress(ipaddress.ip_address(ip)))
+    except ValueError:
+        pass
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(private.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(expires)
+            .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(private, hashes.SHA256()))
+    crt.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key.write_bytes(private.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()))
+    save_json(meta, {"ip": ip, "expires": expires.timestamp() - 86400})
+    return crt, key
+
+
+class PhoneLink:
+    """A tiny web page served from this PC. A phone on the same Wi-Fi opens it (via a
+    QR code); the page watches the phone camera and, when a card is sharp and still,
+    sends one full-resolution frame, which lands in `incoming`.
+    It uses https (needed for the phone's camera). If a certificate can't be made it
+    falls back to plain http, where the phone can only send photos."""
+    MAX_BYTES = 40 * 1024 * 1024
+
+    def __init__(self, cert_dir=None):
         self.token = secrets.token_urlsafe(9)     # makes the address impossible to guess
-        self.incoming = queue.Queue()             # (job id, picture)
+        self.incoming = queue.Queue()             # (job id, picture, came from live view?)
         self.status = {}                          # job id -> {"state", "text"}
         self.received = 0
+        self.secure = False
+        self.warning = ""
         self._next_id = 1
         self._lock = threading.Lock()
+        self._cert_dir = cert_dir
         self.server = None
         self.url = ""
 
-    def new_job(self, img):
+    def new_job(self, img, live=False):
         with self._lock:
             job = self._next_id
             self._next_id += 1
             self.status[job] = {"state": "waiting", "text": ""}
             self.received += 1
-        self.incoming.put((job, img))
+        self.incoming.put((job, img, live))
         return job
 
     def set_status(self, job, state, text=""):
@@ -1294,8 +1448,10 @@ class PhoneLink:
             return dict(self.status.get(job, {"state": "unknown", "text": ""}))
 
     def start(self):
+        import ssl
         link = self
         base = f"/s/{self.token}/"
+        ip = lan_ip()
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args, **kwargs):
@@ -1340,20 +1496,43 @@ class PhoneLink:
                 if img is None:
                     self._reply(400, '{"error": "that does not look like a picture"}')
                     return
-                self._reply(200, json.dumps({"id": link.new_job(img)}))
+                live = parse_qs(u.query).get("live", ["0"])[0] == "1"
+                self._reply(200, json.dumps({"id": link.new_job(img, live)}))
+
+        ctx = None
+        try:
+            crt, key = ensure_certificate(ip, self._cert_dir)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(str(crt), str(key))
+        except Exception as e:  # noqa: BLE001 - fall back to plain http, photos only
+            ctx = None
+            self.warning = f"Secure link unavailable ({type(e).__name__}); photos only."
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def get_request(self):
+                sock, addr = self.socket.accept()
+                if ctx is not None:      # the handshake happens in the worker thread, so a
+                    sock = ctx.wrap_socket(sock, server_side=True,   # stalled phone can't block us
+                                           do_handshake_on_connect=False)
+                return sock, addr
+
+            def handle_error(self, request, client_address):
+                pass                     # phones drop connections while accepting the certificate
 
         server = None
         for port in (8765, 8766, 8767, 0):
             try:
-                server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+                server = Server(("0.0.0.0", port), Handler)
                 break
             except OSError:
                 continue
         if server is None:
             raise OSError("couldn't open a network port")
-        server.daemon_threads = True
         self.server = server
-        self.url = f"http://{lan_ip()}:{server.server_address[1]}{base}"
+        self.secure = ctx is not None
+        self.url = f"{'https' if self.secure else 'http'}://{ip}:{server.server_address[1]}{base}"
         threading.Thread(target=lambda: server.serve_forever(poll_interval=0.2),
                          daemon=True).start()
 
@@ -1852,10 +2031,18 @@ class PhoneWindow(tk.Toplevel):
         body = ttk.Frame(self, padding=20)
         body.pack()
         ttk.Label(body, text="Scan with your phone", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(body, style="Muted.TLabel", justify="left", wraplength=360, text=(
-            "1. Connect your phone to the same Wi-Fi as this computer.\n"
-            "2. Point your phone's camera at this code and open the link.\n"
-            "3. Tap Take a photo. It appears here for you to confirm.")).pack(anchor="w", pady=(6, 12))
+        steps = ("1. Connect your phone to the same Wi-Fi as this computer.\n"
+                 "2. Point your phone's camera at this code and open the link.\n"
+                 "3. The first time, Safari says the connection isn't private: tap Show Details, "
+                 "then visit this website. That's our own secure link.\n"
+                 "4. Allow the camera, then hold a card in the frame. It is sent when it's sharp "
+                 "and still, and you confirm it here.") if link.secure else (
+                 "1. Connect your phone to the same Wi-Fi as this computer.\n"
+                 "2. Point your phone's camera at this code and open the link.\n"
+                 "3. Tap Take a photo. It appears here for you to confirm.\n\n"
+                 + (link.warning or "The secure link isn't available, so live scanning is off."))
+        ttk.Label(body, style="Muted.TLabel", justify="left", wraplength=380,
+                  text=steps).pack(anchor="w", pady=(6, 12))
         qr = make_qr_image(link.url)
         panel = ttk.Frame(body, style="Panel.TFrame", padding=14)
         panel.pack()
@@ -1873,7 +2060,7 @@ class PhoneWindow(tk.Toplevel):
         ttk.Label(body, style="Muted.TLabel", justify="left", wraplength=360, text=(
             "If Windows asks about the firewall, choose Allow (private networks). "
             "The link only works while this window is open, and only for people "
-            "with this exact address.")).pack(anchor="w", pady=(0, 8))
+            "with this exact address. Keep the phone screen on.")).pack(anchor="w", pady=(0, 8))
         ttk.Label(body, textvariable=self.status_var, style="Section.TLabel").pack(anchor="w")
         ttk.Button(body, text="Stop phone link", command=self.close).pack(anchor="e", pady=(10, 0))
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -2543,15 +2730,16 @@ class ScannerApp:
             if self.phone_window is not None:
                 self.phone_window.set_count(link.received)
             if not self.busy and not link.incoming.empty():
-                job, img = link.incoming.get_nowait()
+                job, img, live = link.incoming.get_nowait()
                 self.bring_to_front()
-                self.handle_phone_photo(link, job, img)
+                self.handle_phone_photo(link, job, img, live)
         finally:
             if self.phone is not None:
                 self.root.after(400, self.process_phone)
 
-    def handle_phone_photo(self, link, job, img):
-        card = self.run_add_dialog([extract_card(img, None, frac=1.0)])
+    def handle_phone_photo(self, link, job, img, live=False):
+        # live frames are framed by the phone's card-shaped guide; photos are the whole picture
+        card = self.run_add_dialog([extract_card(img, None, frac=BOX_HEIGHT_FRACTION if live else 1.0)])
         if card:
             link.set_status(job, "added", f"{card['name']} - {money(card['price'])}")
         else:
