@@ -103,6 +103,8 @@ DEBUG_DIR = DATA_DIR / "Debug"
 CARDS_FILE = DATA_DIR / "cards.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 NAMES_FILE = DATA_DIR / "card_names.json"
+SETS_FILE = DATA_DIR / "sets.json"
+TYPES_FILE = DATA_DIR / "creature_types.json"
 
 PREVIEW_W, PREVIEW_H = 640, 360
 RESOLUTIONS = [("1280 x 720", 1280, 720),
@@ -115,7 +117,7 @@ BOX_HEIGHT_FRACTION = 0.92           # size of the guide frame
 # Version. The installer build (GitHub Actions) writes build_info.txt next to the app with
 # the full version (for example 1.3.27) and the name of your GitHub repository, so the
 # app knows what it is and where to look for updates. Running from source: version x.y.0.
-APP_BASE_VERSION = "1.3"
+APP_BASE_VERSION = "1.4"
 
 
 def app_dir():
@@ -371,6 +373,13 @@ def _art_url(c):
     return uris.get("art_crop", "")
 
 
+def _oracle_text(c):
+    t = c.get("oracle_text")
+    if t is None and c.get("card_faces"):
+        t = " // ".join(str(f.get("oracle_text", "")) for f in c["card_faces"])
+    return t or ""
+
+
 def _parse_scryfall(c):
     p = c.get("prices", {})
     return {
@@ -383,6 +392,11 @@ def _parse_scryfall(c):
         "art_url": _art_url(c),
         "price_nonfoil": _money(p.get("usd")),
         "price_foil": _money(p.get("usd_foil") or p.get("usd_etched")),
+        "set_code": str(c.get("set", "")).lower(),
+        "sid": c.get("id", ""),
+        "text": _oracle_text(c),
+        "power": str(c.get("power", "") or ""),
+        "toughness": str(c.get("toughness", "") or ""),
     }
 
 
@@ -435,9 +449,51 @@ _SEARCH_LOCKS = {}
 _SEARCH_LOCKS_GUARD = threading.Lock()
 
 
-def search_mtg(name):
-    """Return a list of candidate printings from Scryfall."""
-    key = name.strip().lower()
+def _clean_query(text):
+    return text.replace('"', "").replace("\\", "").strip()
+
+
+def _clean_set(code):
+    return re.sub(r"[^a-z0-9]", "", (code or "").lower())
+
+
+def _search_cards(q, extras=False):
+    """One Scryfall search (first page, every printing). [] when nothing matches."""
+    params = {"q": q, "unique": "prints", "order": "released"}
+    if extras:
+        params["include_extras"] = "true"          # tokens count as 'extras'
+    r = scryfall("GET", "/cards/search", params=params)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def _token_prints(name, set_code):
+    q = f'!"{name}" t:token'
+    data = _search_cards(q + (f" set:{set_code}" if set_code else ""), extras=True)
+    if not data and set_code:
+        data = _search_cards(q, extras=True)
+    if not data:
+        data = _search_cards(f't:token name:"{name}"', extras=True)
+    return [_parse_scryfall(c) for c in data[:150]]
+
+
+def _land_prints(name, set_code):
+    q = f'!"{name}"'
+    data = _search_cards(q + (f" set:{set_code}" if set_code else ""))
+    if not data and set_code:
+        data = _search_cards(q)
+    return [_parse_scryfall(c) for c in data[:80]]
+
+
+def search_mtg(name, mode="standard", set_code=None):
+    """Return a list of candidate printings from Scryfall.
+    mode "token" searches creature/artifact tokens, "land" searches basic lands
+    (optionally limited to one set), anything else is a normal card search."""
+    name = _clean_query(name)
+    set_code = _clean_set(set_code)
+    key = (mode, name.lower(), set_code)
     if key in _PRINT_CACHE:                # asked before: no need to bother Scryfall again
         return [dict(m) for m in _PRINT_CACHE[key]]
     with _SEARCH_LOCKS_GUARD:              # two threads asking for the same card share one call
@@ -445,30 +501,39 @@ def search_mtg(name):
     with lock:
         if key in _PRINT_CACHE:
             return [dict(m) for m in _PRINT_CACHE[key]]
-        sort = {"unique": "prints", "order": "released"}
-        r = scryfall("GET", "/cards/search", params={"q": f'!"{name}"', **sort})
-        if r.status_code == 404:  # no exact match -> try fuzzy (forgives typos)
-            r = scryfall("GET", "/cards/named", params={"fuzzy": name})
-            if r.status_code == 200:
-                # re-search using the corrected name so we get every printing
-                fixed = r.json().get("name", name)
-                r2 = scryfall("GET", "/cards/search", params={"q": f'!"{fixed}"', **sort})
-                data = r2.json().get("data", []) if r2.status_code == 200 else [r.json()]
-            else:
-                # last resort: any card whose name contains the words we read
-                r3 = scryfall("GET", "/cards/search", params={"q": name, **sort})
-                if r3.status_code != 200:
-                    return []
-                data = r3.json().get("data", [])
+        if mode == "token":
+            out = _token_prints(name, set_code)
+        elif mode == "land":
+            out = _land_prints(name, set_code)
         else:
-            r.raise_for_status()
-            data = r.json().get("data", [])
-        out = [_parse_scryfall(c) for c in data[:15]]
+            out = _standard_prints(name)
         if out:
             if len(_PRINT_CACHE) > 60:
                 _PRINT_CACHE.clear()
             _PRINT_CACHE[key] = [dict(m) for m in out]
         return out
+
+
+def _standard_prints(name):
+    sort = {"unique": "prints", "order": "released"}
+    r = scryfall("GET", "/cards/search", params={"q": f'!"{name}"', **sort})
+    if r.status_code == 404:  # no exact match -> try fuzzy (forgives typos)
+        r = scryfall("GET", "/cards/named", params={"fuzzy": name})
+        if r.status_code == 200:
+            # re-search using the corrected name so we get every printing
+            fixed = r.json().get("name", name)
+            r2 = scryfall("GET", "/cards/search", params={"q": f'!"{fixed}"', **sort})
+            data = r2.json().get("data", []) if r2.status_code == 200 else [r.json()]
+        else:
+            # last resort: any card whose name contains the words we read
+            r3 = scryfall("GET", "/cards/search", params={"q": name, **sort})
+            if r3.status_code != 200:
+                return []
+            data = r3.json().get("data", [])
+    else:
+        r.raise_for_status()
+        data = r.json().get("data", [])
+    return [_parse_scryfall(c) for c in data[:15]]
 
 
 def apply_finish(card, finish):
@@ -496,9 +561,18 @@ def cards_by_names(names):
 
 
 def card_by_set_number(set_code, number):
-    """The exact printing from a set code and collector number, e.g. tla / 58."""
-    r = scryfall("GET", f"/cards/{quote(set_code.lower(), safe='')}/{quote(number.lower(), safe='')}")
-    return _parse_scryfall(r.json()) if r.status_code == 200 else None
+    """The exact printing from a set code and collector number, e.g. tla / 58.
+    Cards print 0058 where Scryfall says 58, so zeros are tried both ways."""
+    code = quote(set_code.lower(), safe="")
+    num = number.lower()
+    tries = [num.lstrip("0") or "0"]
+    if tries[0] != num:
+        tries.append(num)
+    for n in tries:
+        r = scryfall("GET", f"/cards/{code}/{quote(n, safe='')}")
+        if r.status_code == 200:
+            return _parse_scryfall(r.json())
+    return None
 
 
 SET_NUMBER_RE = re.compile(r"^\s*([A-Za-z0-9]{2,6})\s*[ /#:\-]\s*(\d{1,4}[A-Za-z★]?)\s*$")
@@ -537,11 +611,26 @@ def decode_image(blob):
 _IMG_CACHE = {}
 
 
+_BLOB_CACHE = {}
+
+
+def art_blob(url):
+    """The artwork file's bytes (kept for a while so thumbnails don't download it twice)."""
+    if url in _BLOB_CACHE:
+        return _BLOB_CACHE[url]
+    blob = fetch_bytes(url)
+    if blob and len(blob) < 300_000:
+        if len(_BLOB_CACHE) > 150:
+            _BLOB_CACHE.clear()
+        _BLOB_CACHE[url] = blob
+    return blob
+
+
 def fetch_small(url):
     """A small decoded copy of an artwork picture (cached, so it is only fetched once)."""
     if url in _IMG_CACHE:
         return _IMG_CACHE[url]
-    img = decode_image(fetch_bytes(url))
+    img = decode_image(art_blob(url))
     if img is None:
         return None
     img = cv2.resize(img, (96, 72), interpolation=cv2.INTER_AREA)
@@ -640,6 +729,7 @@ ACTIONS = [
     ("snap", "Snap a card with the camera", "space"),
     ("auto", "Switch Manual / Auto capture", "a"),
     ("finish", "Switch new scans Non-foil / Foil", "t"),
+    ("card_mode", "Switch card type Standard / Land / Token", "m"),
     ("phone", "Open the phone link", "p"),
     ("photo", "Add from a photo file", "o"),
     ("add_name", "Add by name or number", "n"),
@@ -850,6 +940,105 @@ class NameCatalog:
             for _, disp in self.rank([(text, 0.6)], limit=limit):
                 add(disp)
         return out
+
+
+class SetCatalog:
+    """Every Scryfall set code (cached on disk). Used to check that a set code read from
+    the small print on a card is a real one, which makes misreads easy to throw away."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.codes = {}
+        self.ready = False
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        data, age = None, None
+        try:
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            data = saved.get("sets")
+            age = time.time() - float(saved.get("fetched", 0))
+        except Exception:
+            pass
+        if data:
+            self.build(data)
+        if not data or (age is not None and age > 30 * 86400):
+            try:
+                r = scryfall("GET", "/sets", timeout=30)
+                r.raise_for_status()
+                fresh = [{"code": x.get("code"), "name": x.get("name"), "type": x.get("set_type")}
+                         for x in r.json().get("data", []) if x.get("code")]
+                if fresh:
+                    save_json(self.path, {"fetched": time.time(), "sets": fresh})
+                    if not data:
+                        self.build(fresh)
+            except Exception:
+                pass
+
+    def build(self, sets):
+        self.codes = {str(x["code"]).lower(): x for x in sets if x.get("code")}
+        self.ready = bool(self.codes)
+
+    def known(self, code):
+        return str(code).lower() in self.codes
+
+
+EXTRA_TOKEN_NAMES = ["Treasure", "Clue", "Food", "Blood", "Map", "Powerstone", "Incubator",
+                     "Gold", "Junk", "Shard", "Role", "Walker", "Copy", "Emblem"]
+
+
+class TypeCatalog:
+    """Creature types (Angel, Soldier, Zombie ...). Token names are almost always creature
+    types, so this fixes misreads like 'Ange1' -> 'Angel'."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lower = {t.lower(): t for t in EXTRA_TOKEN_NAMES}
+        self.ready = False
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        types, age = None, None
+        try:
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            types = saved.get("types")
+            age = time.time() - float(saved.get("fetched", 0))
+        except Exception:
+            pass
+        if types:
+            self.build(types)
+        if not types or (age is not None and age > 30 * 86400):
+            try:
+                r = scryfall("GET", "/catalog/creature-types", timeout=30)
+                r.raise_for_status()
+                fresh = r.json().get("data", [])
+                if fresh:
+                    save_json(self.path, {"fetched": time.time(), "types": fresh})
+                    if not types:
+                        self.build(fresh)
+            except Exception:
+                pass
+
+    def build(self, types):
+        for t in types:
+            self.lower[str(t).lower()] = str(t)
+        self.ready = True
+
+    def correct(self, text):
+        """'ange1 warrlor' -> 'Angel Warrior' (words that match nothing are kept as read)."""
+        out = []
+        for w in re.findall(r"[A-Za-z']+", text):
+            lw = w.lower()
+            if lw in self.lower:
+                out.append(self.lower[lw])
+                continue
+            near = difflib.get_close_matches(lw, list(self.lower), n=1, cutoff=0.78)
+            out.append(self.lower[near[0]] if near else w.title())
+        return " ".join(out)
 
 
 # ------------------------------------------------- finding and fixing a card
@@ -1066,21 +1255,307 @@ def ocr_read_iter(card, treatments=4):
             yield text, conf
 
 
-def recognize(cards, catalog, debug_dir=None, online=True, emit=None):
-    """Work out which card this is. cards: straightened pictures, sharpest first.
-    emit(kind, value) is called as results arrive so the screen can update early:
-      "names" - text-only guesses (fast), "art" - guesses with artwork.
-    Returns {"reads": [...], "cands": [{name, final, name_score, art_score, art_bytes}],
-    "notes": [problems worth telling the user about]}"""
-    emit = emit or (lambda kind, value: None)
-    prepared = [enhance(c) for c in cards]
+# ----------------------------------------------------- card types and small print
+CARD_MODES = [("standard", "Standard"), ("land", "Land"), ("token", "Token")]
+BASIC_LANDS = {norm(n) for n in (
+    "Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes", "Snow-Covered Plains",
+    "Snow-Covered Island", "Snow-Covered Swamp", "Snow-Covered Mountain",
+    "Snow-Covered Forest", "Snow-Covered Wastes")}
+BASIC_COLOR = {"plains": "W", "island": "U", "swamp": "B", "mountain": "R", "forest": "G"}
+BASIC_BY_COLOR = {v: k.title() for k, v in BASIC_COLOR.items()}
+NUMBER_BONUS = 0.08            # normal cards: a matching set + number only nudges the order
+NUMBER_BONUS_SPECIAL = 0.30    # lands and tokens share names, so the number counts for more
+
+# where things are on a straightened card (fractions of its width / height)
+COLLECTOR_BOX = (0.03, 0.918, 0.55, 0.992)    # set code + collector number, bottom-left
+TYPE_BOX = (0.06, 0.545, 0.80, 0.625)         # "Token Creature - Angel"
+TEXT_BOX = (0.08, 0.635, 0.92, 0.855)         # rules text ("Flying")
+PT_BOX = (0.66, 0.885, 0.96, 0.950)           # power / toughness, e.g. 4/4
+
+
+def basic_base(name):
+    """'Snow-Covered Forest' -> 'forest'."""
+    return norm(name).replace("snowcovered ", "")
+
+
+def same_number(a, b):
+    return str(a).lower().lstrip("0") == str(b).lower().lstrip("0")
+
+
+def ocr_lines(img):
+    """[(text, confidence)] one entry per printed line, top to bottom."""
+    try:
+        result, _ = _get_ocr_engine()(img)
+    except Exception:
+        return []
+    if not result:
+        return []
+    items = []
+    for r in result:
+        try:
+            ys = [pt[1] for pt in r[0]]
+            xs = [pt[0] for pt in r[0]]
+            items.append((sum(ys) / len(ys), min(xs), max(ys) - min(ys), str(r[1]), float(r[2])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    items.sort()
+    lines = []
+    for y, x, h, text, conf in items:
+        if lines and abs(y - lines[-1]["y"]) <= 0.6 * max(h, lines[-1]["h"], 1):
+            lines[-1]["parts"].append((x, text, conf))
+        else:
+            lines.append({"y": y, "h": h, "parts": [(x, text, conf)]})
+    out = []
+    for ln in lines:
+        parts = sorted(ln["parts"])
+        out.append((" ".join(t for _, t, _ in parts), sum(c for _, _, c in parts) / len(parts)))
+    return out
+
+
+def _prep_strip(card, box, scale):
+    h, w = card.shape[:2]
+    x0, y0, x1, y1 = box
+    strip = card[int(h * y0):int(h * y1), int(w * x0):int(w * x1)]
+    return cv2.resize(strip, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+
+def _treatments(strip, grid=(4, 4)):
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=grid).apply(gray)
+    return {"plain": strip, "contrast": cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
+            "inverted": cv2.cvtColor(255 - clahe, cv2.COLOR_GRAY2BGR)}
+
+
+def read_region(card, box, scale=2.5, raw=False, treatments=("plain", "contrast")):
+    """Best (text, confidence) read of one part of the card."""
+    if not ocr_available():
+        return "", 0.0
+    imgs = _treatments(_prep_strip(card, box, scale))
+    best = ("", 0.0)
+    for t in treatments:
+        lines = ocr_lines(imgs[t])
+        if not lines:
+            continue
+        text = " ".join(x for x, _ in lines)
+        conf = sum(c for _, c in lines) / len(lines)
+        if not raw:
+            text = clean_read(text)
+        if text and conf > best[1]:
+            best = (text, conf)
+    return best
+
+
+_SET_FIX = (("0", "O"), ("O", "0"), ("1", "I"), ("I", "1"), ("5", "S"), ("S", "5"),
+            ("8", "B"), ("B", "8"))
+
+
+def parse_collector(texts, sets):
+    """Pick the set code and collector number out of the small print at the bottom-left
+    of a card (for example '0275 R' over 'MOM * EN'). Set codes are only accepted when
+    they are real ones. Returns [(set code, number or None)], most likely first."""
+    t = " ".join(texts).upper()
+    for ch in "•·*|.,;:★☆":
+        t = t.replace(ch, " ")
+    numbers, codes = [], []
+    for tok in re.findall(r"[A-Z0-9/]+", t):
+        head = tok.split("/")[0]
+        if not head:
+            continue
+        fixed = head.translate(str.maketrans("OIL", "011"))
+        digits = sum(c.isdigit() for c in head)
+        if re.fullmatch(r"\d{1,4}", fixed) and digits >= len(head) - 1:
+            numbers.append(fixed.lstrip("0") or "0")
+            continue
+        if 3 <= len(tok) <= 5 and "/" not in tok:
+            variants = [tok] + [tok.replace(a, b) for a, b in _SET_FIX if a in tok]
+            for v in variants:
+                if sets.known(v) and v.lower() not in codes:
+                    codes.append(v.lower())
+                    break
+    out = []
+    for code in codes:
+        out.append((code, numbers[0] if numbers else None))
+    out.sort(key=lambda g: g[1] is None)
+    return out[:3]
+
+
+def read_collector(card, sets):
+    """OCR the small print at the bottom-left (modern frames, 2015 and later).
+    Returns (guesses, raw lines). Light text on a black border is tried both ways."""
+    if not ocr_available() or sets is None or not sets.ready or card is None:
+        return [], []
+    imgs = _treatments(_prep_strip(card, COLLECTOR_BOX, 4.0), grid=(2, 4))
+    raw = []
+    for name in ("contrast", "inverted", "plain"):
+        lines = [x for x, _ in ocr_lines(imgs[name])]
+        raw.extend(lines)
+        guesses = parse_collector(lines, sets)
+        if guesses and guesses[0][1] is not None:
+            return guesses, raw
+    return parse_collector(raw, sets), raw
+
+
+def parse_pt(text):
+    """'4/4' (or '44', '4 4') -> ('4', '4'), else None."""
+    nums = re.findall(r"\*|\d+", text or "")
+    if len(nums) >= 2:
+        return nums[0], nums[1]
+    if len(nums) == 1 and len(nums[0]) == 2:
+        return nums[0][0], nums[0][1]
+    return None
+
+
+def text_similarity(read, truth):
+    r, t = norm(read), norm(truth)
+    if not t:
+        return 1.0 if len(r) < 6 else 0.35      # a plain token has no rules text
+    if not r:
+        return 0.35
+    rw = {w for w in r.split() if len(w) > 2}
+    tw = {w for w in t.split() if len(w) > 2}
+    jac = len(rw & tw) / len(rw | tw) if (rw | tw) else 0.0
+    return max(similarity(r, t), jac)
+
+
+def pt_score(pt, m):
+    tp, tt = m.get("power", ""), m.get("toughness", "")
+    if pt is None:
+        return 0.8 if not tp and not tt else 0.4
+    if not tp and not tt:
+        return 0.2
+    hits = (pt[0] == tp) + (pt[1] == tt)
+    return (1.0, 0.35, 0.0)[2 - hits]
+
+
+def land_color_votes(card):
+    """Which basic land does the big mana symbol in the middle of the text box look like?
+    {"W","U","B","R","G"} -> 0..1. A hint only: all zeros when nothing symbol-like is there."""
+    votes = dict.fromkeys("WUBRG", 0.0)
+    h, w = card.shape[:2]
+    patch = card[int(h * 0.68):int(h * 0.84), int(w * 0.38):int(w * 0.62)]
+    if patch.size == 0:
+        return votes
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    ph, pw = hsv.shape[:2]
+    yy, xx = np.ogrid[:ph, :pw]
+    disc = ((xx - pw / 2) / (pw / 2)) ** 2 + ((yy - ph / 2) / (ph / 2)) ** 2 <= 1.0
+    hue, sat, val = (hsv[..., 0][disc].astype(float), hsv[..., 1][disc].astype(float),
+                     hsv[..., 2][disc].astype(float))
+    if hue.size == 0:
+        return votes
+    colourful = (sat > 45) & (val > 70)
+    frac = float(colourful.mean())
+    if frac < 0.12:                              # mostly grey / white / black
+        mv = float(val.mean())
+        if mv < 150:
+            votes["B"] = 0.7
+        elif mv > 200:
+            votes["W"] = 0.5
+        else:
+            votes["B"], votes["W"] = 0.3, 0.3
+        return votes
+    wts = sat[colourful]
+    ang = hue[colourful] * 2 * np.pi / 180.0     # hue is a circle (red wraps around)
+    mh = (np.degrees(np.arctan2((np.sin(ang) * wts).sum(), (np.cos(ang) * wts).sum())) % 360) / 2
+    strength = min(1.0, frac * 2)
+
+    def near(centre, width):
+        d = min(abs(mh - centre), 180 - abs(mh - centre))
+        return max(0.0, 1.0 - d / width) * strength
+
+    votes["U"] = near(105, 18)
+    votes["G"] = near(60, 22)
+    votes["R"] = near(2, 12)
+    votes["W"] = near(25, 12)
+    return votes
+
+
+def score_token(m, fields, art=None, art_stage=False, sid_hit=None):
+    """How well one token printing fits what was read: type line, rules text, power and
+    toughness, artwork, and (strongest) a matching set code + number."""
+    type_s = (similarity(norm(fields["type"]), norm(m.get("type_line", "")))
+              if fields.get("type") else 0.5)
+    text_s = text_similarity(fields.get("text", ""), m.get("text", ""))
+    pt_s = pt_score(fields.get("pt"), m)
+    if art is None:
+        base = (0.2 * type_s + 0.2 * text_s + 0.15 * pt_s) / 0.55
+        if art_stage:
+            base *= 0.6                        # couldn't compare its artwork: rank below those we could
+    else:
+        base = 0.45 * art + 0.2 * type_s + 0.2 * text_s + 0.15 * pt_s
+    hit = bool(sid_hit) and m.get("sid") == sid_hit
+    if hit:
+        base += NUMBER_BONUS_SPECIAL
+    detail = "art " + (f"{int(round(art * 100))}" if art is not None else "-") + (" no.ok" if hit else "")
+    return min(1.0, base), detail
+
+
+def score_land(m, name_conf, art=None, sid_hit=None):
+    base = 0.5 * name_conf if art is None else 0.8 * art + 0.2 * name_conf
+    hit = bool(sid_hit) and m.get("sid") == sid_hit
+    if hit:
+        base += NUMBER_BONUS_SPECIAL
+    detail = "art " + (f"{int(round(art * 100))}" if art is not None else "-") + (" no.ok" if hit else "")
+    return min(1.0, base), detail
+
+
+def token_name_guesses(name_reads, type_text, types):
+    """Possible token names, best first: the title as read (spell-checked against creature
+    types), then the creature types on the type line, which are very often the name."""
+    out = []
+
+    def add(n):
+        n = n.strip()
+        if n and n.lower() not in {x.lower() for x in out}:
+            out.append(n)
+
+    fix = (lambda t: types.correct(t)) if types is not None and types.ready else (lambda t: t)
+    for text, _ in sorted(name_reads, key=lambda r: -r[1])[:3]:
+        add(fix(text))
+    after = re.split(r"[—–-]", type_text or "", maxsplit=1)
+    if len(after) == 2 and after[1].strip():
+        add(fix(after[1]))
+    return out
+
+
+def _merge_prints(first, second):
+    seen = {m.get("sid") for m in first}
+    return first + [m for m in second if m.get("sid") not in seen]
+
+
+def _rows(matches, limit=6):
+    """The 'best guesses' list for lands and tokens: the top printings."""
+    rows = []
+    for m in matches[:limit]:
+        label = f"{m['name']}  -  {m.get('set_code', '').upper()} #{m.get('number', '')}"
+        if m.get("power") or m.get("toughness"):
+            label += f"   {m.get('power', '')}/{m.get('toughness', '')}"
+        blob = _BLOB_CACHE.get(m.get("art_url", ""))
+        rows.append({"name": m["name"], "label": label, "final": m.get("final"),
+                     "name_score": m.get("final"), "art_score": m.get("art_score"),
+                     "art_bytes": blob, "detail": m.get("detail", "")})
+    return rows
+
+
+def _warm_blobs(matches, limit=6):
+    urls = [m["art_url"] for m in matches[:limit] if m.get("art_url")]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(art_blob, urls))
+
+
+def _payload(kind, ms, reads, mode, note="", hit=None, confirmed=None):
+    return {"cands": _rows(ms), "matches": ms, "reads": list(reads), "mode": mode,
+            "note": note, "hit": hit, "confirmed": confirmed}
+
+
+def read_name_reads(prepared, catalog, treatments=4):
+    """Read the title from each prepared picture, cheapest first, stopping once sure."""
     reads, done = [], False
     deadline = time.time() + 14          # never make the user wait much longer than this
-
     for n, card in enumerate(prepared):
-        for text, conf in ocr_read_iter(card, treatments=4 if n == 0 else 2):
+        for text, conf in ocr_read_iter(card, treatments=treatments if n == 0 else 2):
             reads.append((text, conf))
-            if catalog.ready:
+            if catalog is not None and catalog.ready:
                 top = catalog.rank([(text, conf)], limit=1)
                 if top and top[0][1] >= 0.95:
                     done = True
@@ -1093,6 +1568,15 @@ def recognize(cards, catalog, debug_dir=None, online=True, emit=None):
     if prepared and not done and (not reads or max(c for _, c in reads) < 0.5):
         for text, conf in ocr_read_iter(cv2.rotate(prepared[0], cv2.ROTATE_180)):  # upside down?
             reads.append((text, conf))
+    return reads
+
+
+def _recognize_standard(cards, catalog, online, emit, sets, read_number, reads=None, prepared=None):
+    """A normal card: name, then artwork, then (last, because the print is tiny) the set
+    code and number, which only nudge the order and pick the printing."""
+    prepared = prepared if prepared is not None else [enhance(c) for c in cards]
+    if reads is None:
+        reads = read_name_reads(prepared, catalog)
 
     notes = []
     scores = dict(catalog.rank(reads, limit=10)) if catalog.ready else {}
@@ -1113,7 +1597,7 @@ def recognize(cards, catalog, debug_dir=None, online=True, emit=None):
     ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:6]
     cands = [{"name": n, "name_score": s, "art_score": None, "final": s, "art_bytes": None}
              for n, s in ranked]
-    emit("names", {"cands": [dict(c) for c in cands], "reads": list(reads)})
+    emit("names", {"cands": [dict(c) for c in cands], "reads": list(reads), "mode": "standard"})
 
     photo_art = art_region(prepared[0]) if prepared else None
     if cands and online and prepared:      # compare artwork like a visual search would
@@ -1146,7 +1630,44 @@ def recognize(cards, catalog, debug_dir=None, online=True, emit=None):
             if c["art_score"] is not None:
                 c["final"] = min(1.0, 0.65 * c["name_score"] + 0.35 * c["art_score"])
         cands.sort(key=lambda c: -c["final"])
-        emit("art", {"cands": [dict(c) for c in cands]})
+        emit("art", {"cands": [dict(c) for c in cands], "mode": "standard"})
+
+    hit, confirmed, number_reads = None, False, []
+    if read_number and online and cands and prepared and sets is not None and sets.ready:
+        guesses, number_reads = read_collector(cards[0], sets)
+        rec = None
+        try:                               # fast endpoint (10 requests / second)
+            for code, num in guesses[:2]:
+                if num:
+                    rec = card_by_set_number(code, num)
+                    if rec:
+                        break
+        except ScryfallBusy as e:
+            notes.append(str(e))
+        except Exception:
+            rec = None
+        if rec:
+            key = norm(rec["name"])
+            match = next((c for c in cands if norm(c["name"]) == key), None)
+            if match:
+                match["final"] = min(1.0, match["final"] + NUMBER_BONUS)
+                match["number_hit"] = True
+                hit, confirmed = rec, True
+            elif cands[0]["final"] < 0.5:  # the name was unreadable: the number is all we have
+                new = {"name": rec["name"], "name_score": 0.55, "art_score": None,
+                       "final": 0.55, "art_bytes": None, "number_hit": True}
+                try:
+                    blob = art_blob(rec.get("art_url", ""))
+                    img = decode_image(blob)
+                    if img is not None and photo_art is not None:
+                        new["art_bytes"], new["art_score"] = blob, art_similarity(photo_art, img)
+                except Exception:
+                    pass
+                cands.append(new)
+                hit = rec
+            cands.sort(key=lambda c: -c["final"])
+            emit("number", {"cands": [dict(c) for c in cands], "mode": "standard",
+                            "hit": hit, "confirmed": confirmed})
 
     if cands and online and photo_art is not None:   # get the printings ready before they're asked for
         try:
@@ -1155,31 +1676,226 @@ def recognize(cards, catalog, debug_dir=None, online=True, emit=None):
                 rank_printings_by_art(photo_art, ms)
         except Exception:
             pass
+    return {"reads": reads, "cands": cands, "notes": notes, "matches": None, "mode": "standard",
+            "hit": hit, "confirmed": confirmed, "number_reads": number_reads}
 
-    if debug_dir:
+
+def _art_pass(ms, photo_art, limit):
+    """Compare artwork for the first `limit` printings; stores art_score on each."""
+    scores = rank_printings_by_art(photo_art, ms, limit=limit)
+    for i, sc in scores.items():
+        ms[i]["art_score"] = sc
+    return scores
+
+
+def _recognize_land(cards, catalog, online, emit, sets, read_number):
+    """Basic lands: Forest has hundreds of printings with different art. Find which basic it
+    is (the name, backed up by the colour of the big mana symbol), then pick the printing by
+    artwork and the set code + number. Returns (result or None, reads, prepared); None means
+    'this isn't a basic land' (non-basic lands have their own names, like Tranquil Cove)."""
+    prepared = [enhance(c) for c in cards]
+    reads = read_name_reads(prepared, catalog)
+    ranked = catalog.rank(reads, limit=10) if catalog.ready else []
+    votes = land_color_votes(prepared[0])
+    best = ranked[0] if ranked else None
+    if best and norm(best[0]) not in BASIC_LANDS and best[1] >= 0.8:
+        return None, reads, prepared
+    basics = [(n, sc) for n, sc in ranked if norm(n) in BASIC_LANDS]
+    top_color = max(votes, key=votes.get)
+    conf_color = votes[top_color]
+    name, name_conf = (basics[0] if basics else (None, 0.0))
+    if name:
+        if name_conf < 0.75 and conf_color >= 0.6 and BASIC_COLOR.get(basic_base(name)) != top_color:
+            name, name_conf = BASIC_BY_COLOR[top_color], 0.5 * conf_color   # the symbol outvotes a poor read
+    elif conf_color >= 0.5:
+        name, name_conf = BASIC_BY_COLOR[top_color], 0.5 * conf_color
+    if not name or not online:
+        return None, reads, prepared
+
+    notes = []
+    guesses, number_reads = (read_collector(cards[0], sets) if read_number else ([], []))
+    set_hint = guesses[0][0] if guesses else None
+    num_hint = guesses[0][1] if guesses else None
+    ms = []
+    try:
+        if set_hint:
+            ms = search_mtg(name, "land", set_hint)
+        if not ms or not any(m["set_code"] == set_hint for m in ms) or len(ms) < 3:
+            ms = _merge_prints(ms, search_mtg(name, "land"))
+    except ScryfallBusy as e:
+        notes.append(str(e))
+    except Exception:
+        pass
+    if not ms:
+        cands = [{"name": name, "name_score": name_conf, "art_score": None,
+                  "final": name_conf, "art_bytes": None}]
+        emit("names", {"cands": cands, "reads": list(reads), "mode": "land"})
+        return {"reads": reads, "cands": cands, "notes": notes, "matches": None, "mode": "land",
+                "hit": None, "confirmed": False, "number_reads": number_reads}, reads, prepared
+
+    sid_hit = next((m["sid"] for m in ms if set_hint and num_hint and m["set_code"] == set_hint
+                    and same_number(m["number"], num_hint)), None)
+
+    def rescore():
+        for m in ms:
+            m["final"], m["detail"] = score_land(m, name_conf, m.get("art_score"), sid_hit)
+        ms.sort(key=lambda m: -m["final"])
+
+    rescore()
+    note = (f"Read as {name}. " + (f"Set {set_hint.upper()} found on the card. " if set_hint else
+            "The set couldn't be read, so type the set code under 'by the number' if the match looks wrong."))
+    emit("names", _payload("names", ms, reads, "land", note, None, sid_hit))
+    photo_art = art_region(prepared[0])
+    _art_pass(ms, photo_art, 80)
+    rescore()
+    _warm_blobs(ms)
+    emit("art", _payload("art", ms, reads, "land", note, None, sid_hit))
+    return {"reads": reads, "cands": _rows(ms), "notes": notes, "matches": ms, "mode": "land",
+            "hit": None, "confirmed": sid_hit, "number_reads": number_reads, "note": note}, reads, prepared
+
+
+def _recognize_token(cards, catalog, online, emit, sets, types, read_number):
+    """Tokens: Angel, Soldier, Zombie ... the same name on many cards. Reads the title, the
+    type line below the art, the rules text and the power/toughness, then compares them and
+    the artwork with every printing of that token."""
+    prepared = [enhance(c) for c in cards]
+    card0 = prepared[0]
+    name_reads = read_name_reads(prepared, None, treatments=2)
+    type_text, _ = read_region(card0, TYPE_BOX, raw=True)
+    rules_text, _ = read_region(card0, TEXT_BOX, 2.0)
+    pt_raw, _ = read_region(card0, PT_BOX, 3.0, raw=True, treatments=("contrast", "plain"))
+    fields = {"type": type_text, "text": rules_text, "pt": parse_pt(pt_raw)}
+    names = token_name_guesses(name_reads, type_text, types)
+    notes, ms = [], []
+    if online:
+        for nm in names[:3]:
+            try:
+                ms = search_mtg(nm, "token")
+            except ScryfallBusy as e:
+                notes.append(str(e))
+                break
+            except Exception:
+                ms = []
+            if ms:
+                break
+    base = {"reads": name_reads, "notes": notes, "mode": "token", "hit": None,
+            "confirmed": None, "number_reads": [], "fields": fields}
+    if not ms:
+        note = ("Couldn't find a token with that name. Type its name (like Angel) and press Search."
+                if online else "No internet, so tokens can't be looked up.")
+        emit("names", {"cands": [], "reads": list(name_reads), "mode": "token", "note": note})
+        return dict(base, cands=[], matches=None, note=note)
+
+    sid_hit = None
+    art_stage = False
+
+    def rescore():
+        for m in ms:
+            m["final"], m["detail"] = score_token(m, fields, m.get("art_score"), art_stage, sid_hit)
+        ms.sort(key=lambda m: -m["final"])
+
+    rescore()
+    note = f"Read as {ms[0]['name']} token. "
+    emit("names", _payload("names", ms, name_reads, "token", note))
+    photo_art = art_region(card0)
+    _art_pass(ms, photo_art, 24)       # ms is ordered best-first, so these are the likely ones
+    art_stage = True
+    rescore()
+    _warm_blobs(ms)
+    emit("art", _payload("art", ms, name_reads, "token", note))
+
+    hit, number_reads = None, []
+    if read_number and sets is not None and sets.ready:
+        guesses, number_reads = read_collector(cards[0], sets)
         try:
-            save_debug(debug_dir, cards, reads, cands)
+            for code, num in guesses[:2]:
+                if not num:
+                    continue
+                found = next((m for m in ms if m["set_code"] == code and same_number(m["number"], num)), None)
+                if found is None:
+                    rec = card_by_set_number(code, num)
+                    if rec and norm(rec["name"]) == norm(ms[0]["name"]):
+                        img = fetch_small(rec.get("art_url", "")) if rec.get("art_url") else None
+                        if img is not None:
+                            rec["art_score"] = art_similarity(photo_art, img)
+                        ms.append(rec)
+                        found = rec
+                if found is not None:
+                    sid_hit, hit = found["sid"], found
+                    break
+        except ScryfallBusy as e:
+            notes.append(str(e))
         except Exception:
             pass
-    return {"reads": reads, "cands": cands, "notes": notes}
+        if sid_hit:
+            rescore()
+            _warm_blobs(ms)
+            emit("number", _payload("number", ms, name_reads, "token", note, hit, sid_hit))
+    return dict(base, cands=_rows(ms), matches=ms, hit=hit, confirmed=sid_hit,
+                number_reads=number_reads, note=note)
 
 
-def save_debug(debug_dir, cards, reads, cands):
+def recognize(cards, catalog, debug_dir=None, online=True, emit=None, mode="standard",
+              sets=None, types=None, read_number=True):
+    """Work out which card this is. cards: straightened pictures, sharpest first.
+    mode: "standard", "land" (basic lands) or "token".
+    emit(kind, value) is called as results arrive so the screen can update early:
+      "names" - first guesses (fast), "art" - with artwork compared, "number" - with the
+      set code + number from the bottom-left of the card.
+    Returns {"reads", "cands": [{name, final, ...}], "matches": printings or None, "notes",
+    "mode" (what was actually used), "hit", "confirmed", "number_reads"}"""
+    emit = emit or (lambda kind, value: None)
+    res, pre = None, {}
+    if mode == "land" and cards:
+        res, reads, prepared = _recognize_land(cards, catalog, online, emit, sets, read_number)
+        if res is None:
+            pre = {"reads": reads, "prepared": prepared}
+    elif mode == "token" and cards:
+        res = _recognize_token(cards, catalog, online, emit, sets, types, read_number)
+    if res is None:
+        res = _recognize_standard(cards, catalog, online, emit, sets, read_number, **pre)
+        if mode == "land" and cards:
+            res["note"] = "That doesn't look like a basic land, so it was matched like a normal card."
+            emit("names", {"cands": [dict(c) for c in res["cands"]], "reads": res["reads"],
+                           "mode": "standard", "note": res["note"]})
+    if debug_dir:
+        try:
+            save_debug(debug_dir, cards, res["reads"], res["cands"], res)
+        except Exception:
+            pass
+    return res
+
+
+def save_debug(debug_dir, cards, reads, cands, res=None):
     d = Path(debug_dir) / datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     d.mkdir(parents=True, exist_ok=True)
     for i, c in enumerate(cards):
         write_image(d / f"card{i}.jpg", c)
-    lines = ["Reads (text, confidence):"] + [f"  {t!r}  {c:.2f}" for t, c in reads]
+    def pct(v):
+        return "-" if v is None else f"{v:.2f}"
+    lines = [f"Mode used: {(res or {}).get('mode', 'standard')}", "", "Reads (text, confidence):"]
+    lines += [f"  {t!r}  {c:.2f}" for t, c in reads]
     lines += ["", "Guesses:"] + [
-        f"  {c['name']}  name={c['name_score']:.2f}  art={c['art_score']}  final={c['final']:.2f}"
-        for c in cands]
+        f"  {c['name']}  name={pct(c.get('name_score'))}  art={pct(c.get('art_score'))}  "
+        f"final={pct(c.get('final'))}" for c in cands]
+    if res:
+        lines += ["", "Small print at the bottom-left (raw lines):"]
+        lines += [f"  {t!r}" for t in res.get("number_reads", [])]
+        if res.get("fields"):
+            lines += ["", f"Token fields: {res['fields']}"]
     (d / "result.txt").write_text("\n".join(lines), encoding="utf-8")
+    if cards:   # the crops the reader looked at, to help tune where things are on a card
+        for name, box in (("collector", COLLECTOR_BOX), ("type", TYPE_BOX), ("text", TEXT_BOX), ("pt", PT_BOX)):
+            try:
+                write_image(d / f"crop_{name}.jpg", _prep_strip(cards[0], box, 2.0))
+            except Exception:
+                pass
 
 
-def rank_printings_by_art(photo_art, matches):
+def rank_printings_by_art(photo_art, matches, limit=12):
     """Compare the photographed artwork with each printing's artwork.
     Returns {index: score} for the printings that could be compared."""
-    todo = [(i, m["art_url"]) for i, m in enumerate(matches[:12]) if m.get("art_url")]
+    todo = [(i, m["art_url"]) for i, m in enumerate(matches[:limit]) if m.get("art_url")]
     if not todo:
         return {}
 
@@ -1188,8 +1904,8 @@ def rank_printings_by_art(photo_art, matches):
         img = fetch_small(url)
         return i, (art_similarity(photo_art, img) if img is not None else None)
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        return {i: s for i, s in ex.map(score, todo) if s is not None}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return {i: sc for i, sc in ex.map(score, todo) if sc is not None}
 
 
 # ------------------------------------------------------- filtering/sorting
@@ -1760,7 +2476,8 @@ class AddCardDialog(tk.Toplevel):
     """Shown after a snap: reads the card, lists the best guesses with artwork,
     lets you pick the printing, finish and quantity - or find it by set + number."""
 
-    def __init__(self, parent, cards, catalog, finish, debug_dir=None):
+    def __init__(self, parent, cards, catalog, finish, debug_dir=None, mode="standard",
+                 sets=None, types=None, read_number=True):
         super().__init__(parent)
         self.configure(bg=C["bg"])
         self.title("Add a card")
@@ -1770,6 +2487,9 @@ class AddCardDialog(tk.Toplevel):
         self.cards = cards
         self.catalog = catalog
         self.debug_dir = debug_dir
+        self.mode = mode
+        self.sets, self.types, self.read_number = sets, types, read_number
+        self._want_sid = None
         self.matches = []
         self.cands = []
         self.loaded_name = ""
@@ -1879,6 +2599,7 @@ class AddCardDialog(tk.Toplevel):
         self.cand_tree.bind("<<TreeviewSelect>>", self._on_cand_select)
         self.tree.bind("<Double-1>", lambda e: self.add())
         self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Control-Return>", lambda e: self.add())
 
         center_on(self, parent)
         try:
@@ -1889,8 +2610,11 @@ class AddCardDialog(tk.Toplevel):
         self.entry.focus_set()
 
         if cards:
-            self.msg_var.set("Reading the card...")
-            self._stream(lambda emit: recognize(self.cards, self.catalog, self.debug_dir, emit=emit),
+            self.msg_var.set({"standard": "Reading the card...", "land": "Reading the land...",
+                              "token": "Reading the token..."}.get(mode, "Reading the card..."))
+            self._stream(lambda emit: recognize(self.cards, self.catalog, self.debug_dir, emit=emit,
+                                                mode=self.mode, sets=self.sets, types=self.types,
+                                                read_number=self.read_number),
                          self._on_stage)
         else:
             self.msg_var.set("Type a few letters of the card name - suggestions appear as you type.")
@@ -1943,27 +2667,69 @@ class AddCardDialog(tk.Toplevel):
         if kind == "error":
             self.msg_var.set("Couldn't read the card automatically. Type a few letters of "
                              "the name, or use the set code and number.")
-        elif kind == "names":
+            return
+        if kind in ("names", "art", "number"):
+            self.mode = val.get("mode", self.mode)
+        if kind in ("names", "art", "number") and val.get("matches"):
+            self._on_printing_stage(kind, val)
+            return
+        if kind == "names":
             self.cands = val["cands"]
             self._show_candidates(self.cands)
             if val["reads"] and not self._typed and not self.name_var.get().strip():
                 self.name_var.set(max(val["reads"], key=lambda r: r[1])[0])
             if not self.cands:
-                self.msg_var.set("Couldn't read this card clearly. Type a few letters of the "
-                                 "name (suggestions appear as you type), or use the set code and number.")
+                self.msg_var.set(val.get("note") or "Couldn't read this card clearly. Type a few "
+                                 "letters of the name (suggestions appear as you type), or use "
+                                 "the set code and number.")
             else:
-                self.msg_var.set("Checking the artwork...")
-        elif kind == "art":
+                self.msg_var.set(val.get("note") or "Checking the artwork...")
+        elif kind in ("art", "number"):
             self.cands = val["cands"]
             self._show_candidates(self.cands)
+            hit = val.get("hit")
+            if hit and val.get("confirmed"):
+                self._want_sid = hit.get("sid")
+                self.set_var.set(str(hit.get("set_code", "")).upper())
+                self.num_var.set(str(hit.get("number", "")))
+                self.msg_var.set(f"The set and number on the card say {hit['set']} #{hit['number']}. "
+                                 "Check it matches, then press Add card (Ctrl+Enter).")
+            else:
+                self.msg_var.set("Best guess is highlighted. Not right? Pick another, or type the name.")
             self._pick_top()
-            self.msg_var.set("Best guess is highlighted. Not right? Pick another, or type the name.")
         elif kind == "done":
             if self.cands and not self.loaded_name:      # artwork never arrived: use the name guess
                 self._pick_top()
             if val.get("notes"):
                 self.msg_var.set(self.msg_var.get() + "  (Scryfall asked us to slow down, "
                                  "so some previews may be missing.)")
+
+    def _on_printing_stage(self, kind, val):
+        """Land / token results arrive as whole printings, so show them directly."""
+        self.cands = val["cands"]
+        self._show_candidates(self.cands)
+        self.matches = val["matches"]
+        self.loaded_name = self.matches[0]["name"]
+        if not self._typed:
+            self.name_var.set(self.loaded_name)
+        self._fill_printings(self.matches)
+        self.tree.selection_set("0")           # the list is already ordered best-first
+        self.tree.see("0")
+        h = val.get("hit")
+        if h and val.get("confirmed"):
+            self.set_var.set(str(h.get("set_code", "")).upper())
+            self.num_var.set(str(h.get("number", "")))
+            if self.matches[0].get("sid") == h.get("sid"):
+                self.msg_var.set(f"{val.get('note', '')}The set and number on the card say "
+                                 f"{h['set']} #{h['number']}. Check it matches, then press Add card (Ctrl+Enter).")
+            else:   # the print says one thing, the artwork / text another: let the person decide
+                top = self.matches[0]
+                self.msg_var.set(f"{val.get('note', '')}The number on the card says {h['set']} #{h['number']}, "
+                                 f"but the artwork and text fit {top['set']} #{top['number']} better. "
+                                 "Check which one you are holding.")
+        else:
+            self.msg_var.set(val.get("note") or "Pick the printing that matches your card.")
+        self.cand_tree.selection_set("0")
 
     # ------------------------------------------------------------ guesses list
     def _show_candidates(self, cands):
@@ -2007,6 +2773,10 @@ class AddCardDialog(tk.Toplevel):
         if idx >= len(self.cands):
             return
         name = self.cands[idx]["name"]
+        if self.mode != "standard" and self.matches and idx < len(self.matches):
+            self.tree.selection_set(str(idx))      # same printing, shown in the list below
+            self.tree.see(str(idx))
+            return
         if name == self.loaded_name:
             return
         self.name_var.set(name)
@@ -2103,7 +2873,8 @@ class AddCardDialog(tk.Toplevel):
         token = self._job
         self.msg_var.set(f"Looking up {name}...")
         self._fill_printings([])
-        self._bg(lambda: search_mtg(name),
+        mode = self.mode
+        self._bg(lambda: (search_mtg(name, mode) if mode != "standard" else []) or search_mtg(name),
                  lambda ok, val: self._on_printings(token, ok, val))
 
     def _explain_failure(self, err):
@@ -2130,6 +2901,13 @@ class AddCardDialog(tk.Toplevel):
             return
         self.msg_var.set(f"{len(val)} printing(s) found. Pick the one you have.")
         self.tree.selection_set("0")
+        want = next((i for i, m in enumerate(val) if self._want_sid and m.get("sid") == self._want_sid), None)
+        if want is not None:
+            self.tree.selection_set(str(want))
+            self.tree.see(str(want))
+            self.msg_var.set(f"Matched by the set and number on the card: {val[want]['set']} "
+                             f"#{val[want]['number']}. Check it, then press Add card (Ctrl+Enter).")
+            return
         if self.photo_art is not None and len(val) > 1:
             self.msg_var.set(f"{len(val)} printings found - comparing artwork...")
             self._bg(lambda: rank_printings_by_art(self.photo_art, val),
@@ -2282,6 +3060,7 @@ class SettingsWindow(tk.Toplevel):
         self.hold_var = tk.DoubleVar(value=app.auto_hold_s)
         self.blur_var = tk.DoubleVar(value=app.blur_min)
         self.upd_var = tk.BooleanVar(value=app.check_updates)
+        self.num_var = tk.BooleanVar(value=app.read_number)
         self.repo_var = tk.StringVar(value=app.settings.get("update_repo", ""))
         self.hold_text = tk.StringVar()
         self.blur_text = tk.StringVar()
@@ -2313,6 +3092,10 @@ class SettingsWindow(tk.Toplevel):
         ttk.Label(f, style="PanelMuted.TLabel", justify="left", wraplength=460, text=(
             "Your cards, settings and scan photos are saved in your Documents folder and are "
             "kept when the app updates.")).pack(anchor="w", pady=(4, 14))
+        ttk.Checkbutton(f, text="Read the set code and number at the bottom-left of the card",
+                        variable=self.num_var,
+                        command=lambda: self.app.set_option("read_number", bool(self.num_var.get()))
+                        ).pack(anchor="w", pady=(0, 6))
         ttk.Checkbutton(f, text="Look for updates when the app starts", variable=self.upd_var,
                         command=lambda: self.app.set_option("check_updates", bool(self.upd_var.get()))
                         ).pack(anchor="w")
@@ -2570,6 +3353,13 @@ class ScannerApp:
         self.cards = load_cards()
         self.catalog = NameCatalog(NAMES_FILE)
         self.catalog.start()
+        self.sets = SetCatalog(SETS_FILE)
+        self.sets.start()
+        self.types = TypeCatalog(TYPES_FILE)
+        self.types.start()
+        self.read_number = bool(self.settings.get("read_number", True))
+        self.card_mode = tk.StringVar(value=self.settings.get("card_mode", "standard")
+                                      if self.settings.get("card_mode") in dict(CARD_MODES) else "standard")
 
         self.finish = tk.StringVar(value=self.settings.get("finish", "nonfoil"))
         self.mode_var = tk.StringVar(value=self.settings.get("mode", "manual"))
@@ -2688,6 +3478,13 @@ class ScannerApp:
         for text, val in (("Non-foil", "nonfoil"), ("Foil", "foil")):
             ttk.Radiobutton(opt, text=text, value=val, variable=self.finish,
                             style="Seg.Toolbutton", command=self.on_finish_change,
+                            takefocus=0).pack(side="left", padx=(0, 2))
+        opt2 = ttk.Frame(cam, style="Panel.TFrame")
+        opt2.pack(fill="x", pady=(8, 0))
+        ttk.Label(opt2, text="Card type", style="PanelMuted.TLabel").pack(side="left", padx=(0, 8))
+        for text, val in CARD_MODES:
+            ttk.Radiobutton(opt2, text=text, value=val, variable=self.card_mode,
+                            style="Seg.Toolbutton", command=self.on_card_mode_change,
                             takefocus=0).pack(side="left", padx=(0, 2))
         self.cam_toggle = ttk.Button(opt, text="Camera  v", style="Link.TButton",
                                      command=self.toggle_camera_settings, takefocus=0)
@@ -2968,7 +3765,7 @@ class ScannerApp:
         self.apply_keybinds()
 
     def key_actions(self):
-        return {"snap": self.snap, "auto": self.toggle_mode, "finish": self.toggle_finish,
+        return {"snap": self.snap, "auto": self.toggle_mode, "finish": self.toggle_finish, "card_mode": self.toggle_card_mode,
                 "phone": self.open_phone, "photo": self.scan_file, "add_name": self.add_by_name,
                 "qty_up": lambda: self.change_qty(1), "qty_down": lambda: self.change_qty(-1),
                 "flip": self.flip_selected, "remove": self.remove_selected,
@@ -3014,6 +3811,21 @@ class ScannerApp:
         self.finish.set("nonfoil" if self.finish.get() == "foil" else "foil")
         self.on_finish_change()
 
+    def on_card_mode_change(self):
+        self.settings["card_mode"] = self.card_mode.get()
+        save_json(SETTINGS_FILE, self.settings)
+        hint = {"standard": "Standard cards: read by name and artwork.",
+                "land": "Basic lands: matched by colour, artwork and the set + number at the bottom-left. "
+                        "Other lands are read like normal cards.",
+                "token": "Tokens: reads the type line, rules text and power/toughness, then the artwork."}
+        self.set_status(hint[self.card_mode.get()])
+        self.canvas.focus_set()
+
+    def toggle_card_mode(self):
+        ids = [m for m, _ in CARD_MODES]
+        self.card_mode.set(ids[(ids.index(self.card_mode.get()) + 1) % len(ids)])
+        self.on_card_mode_change()
+
     # ------------------------------------------------------ settings window
     def set_option(self, name, value):
         self.settings[name] = value
@@ -3024,6 +3836,8 @@ class ScannerApp:
             self.blur_min = _num(value, 45.0, 20.0, 90.0)
         elif name == "check_updates":
             self.check_updates = bool(value)
+        elif name == "read_number":
+            self.read_number = bool(value)
 
     def open_settings(self):
         if self.busy:
@@ -3239,7 +4053,9 @@ class ScannerApp:
         self.busy = True
         try:
             dlg = AddCardDialog(self.root, cards, self.catalog, self.finish.get(),
-                                DEBUG_DIR if self.debug_var.get() else None)
+                                DEBUG_DIR if self.debug_var.get() else None,
+                                mode=self.card_mode.get(), sets=self.sets, types=self.types,
+                                read_number=self.read_number)
             self.root.wait_window(dlg)
             card = dlg.result
         finally:
