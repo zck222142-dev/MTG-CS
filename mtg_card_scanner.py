@@ -1456,10 +1456,11 @@ class AddCardDialog(tk.Toplevel):
         ttk.Label(right, text="Best guesses", style="Section.TLabel").pack(anchor="w")
         cf = ttk.Frame(right, style="Panel.TFrame")
         cf.pack(fill="x", pady=(4, 8))
-        self.cand_tree = ttk.Treeview(cf, columns=("pct",), show="tree", height=3,
+        self.cand_tree = ttk.Treeview(cf, columns=("pct", "detail"), show="tree", height=3,
                                       style="Cand.Treeview", selectmode="browse")
-        self.cand_tree.column("#0", width=440, stretch=True)
-        self.cand_tree.column("pct", width=70, anchor="e", stretch=False)
+        self.cand_tree.column("#0", width=330, stretch=True)
+        self.cand_tree.column("pct", width=60, anchor="e", stretch=False)
+        self.cand_tree.column("detail", width=130, anchor="e", stretch=False)
         csb = ttk.Scrollbar(cf, orient="vertical", command=self.cand_tree.yview)
         self.cand_tree.configure(yscrollcommand=csb.set)
         self.cand_tree.pack(side="left", fill="x", expand=True)
@@ -1588,16 +1589,17 @@ class AddCardDialog(tk.Toplevel):
                                  "name (suggestions appear as you type), or use the set code and number.")
             else:
                 self.msg_var.set("Checking the artwork...")
-                if self.cands[0]["final"] >= 0.9:
-                    self._reselect()
         elif kind == "art":
             self.cands = val["cands"]
             self._show_candidates(self.cands)
-            self._reselect()
+            self._pick_top()
             self.msg_var.set("Best guess is highlighted. Not right? Pick another, or type the name.")
-        elif kind == "done" and val.get("notes"):
-            self.msg_var.set(self.msg_var.get() + "  (Scryfall asked us to slow down, "
-                             "so some previews may be missing.)")
+        elif kind == "done":
+            if self.cands and not self.loaded_name:      # artwork never arrived: use the name guess
+                self._pick_top()
+            if val.get("notes"):
+                self.msg_var.set(self.msg_var.get() + "  (Scryfall asked us to slow down, "
+                                 "so some previews may be missing.)")
 
     # ------------------------------------------------------------ guesses list
     def _show_candidates(self, cands):
@@ -1615,19 +1617,23 @@ class AddCardDialog(tk.Toplevel):
                 except Exception:
                     img = ""
             pct = f"{int(round(c['final'] * 100))}%" if c.get("final") is not None else ""
+            detail = ""
+            if c.get("name_score") is not None:
+                art = c.get("art_score")
+                detail = (f"name {int(round(c['name_score'] * 100))}  art "
+                          + (f"{int(round(art * 100))}" if art is not None else "-"))
             self.cand_tree.insert("", "end", iid=str(i), text="  " + c["name"],
-                                  image=img, values=(pct,))
+                                  image=img, values=(pct, detail))
 
-    def _reselect(self):
-        """Highlight the best guess (unless the user has already taken over)."""
-        if self._typed or not self.cands:
+    def _pick_top(self):
+        """Highlight the best guess (unless the user has already taken over). The list is
+        ordered by name AND artwork together, so the top row is the best overall."""
+        if self._typed or not self.cands or self.cands[0].get("final") is None:
             return
-        idx = next((i for i, c in enumerate(self.cands) if c["name"] == self.loaded_name), None)
-        if idx is None:
-            if self.cands[0]["final"] < 0.5:
-                return
-            idx = 0
-        self.cand_tree.selection_set(str(idx))
+        if self.cands[0]["final"] < 0.5:
+            return
+        self.cand_tree.selection_set("0")
+        self._on_cand_select()          # make sure it loads even if the selection didn't change
 
     def _on_cand_select(self, event=None):
         sel = self.cand_tree.selection()
