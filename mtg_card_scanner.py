@@ -1270,6 +1270,7 @@ NUMBER_BONUS_SPECIAL = 0.30    # lands and tokens share names, so the number cou
 COLLECTOR_BOX = (0.03, 0.918, 0.55, 0.992)    # set code + collector number, bottom-left
 TYPE_BOX = (0.06, 0.545, 0.80, 0.625)         # "Token Creature - Angel"
 TEXT_BOX = (0.08, 0.635, 0.92, 0.855)         # rules text ("Flying")
+BODY_BOX = (0.05, 0.52, 0.95, 0.885)         # type line + rules text (tokens)
 PT_BOX = (0.66, 0.885, 0.96, 0.950)           # power / toughness, e.g. 4/4
 
 
@@ -1393,6 +1394,29 @@ def read_collector(card, sets):
         if guesses and guesses[0][1] is not None:
             return guesses, raw
     return parse_collector(raw, sets), raw
+
+
+def read_token_body(card):
+    """Tokens lay out the area under the art differently from normal cards, so read the whole
+    band and find the type line by its words. Returns (type line, rules text)."""
+    if not ocr_available():
+        return "", ""
+    imgs = _treatments(_prep_strip(card, BODY_BOX, 2.0))
+    best = ("", "")
+    for t in ("plain", "contrast", "inverted"):
+        lines = [x.strip() for x, _ in ocr_lines(imgs[t]) if x.strip()]
+        idx = next((i for i, ln in enumerate(lines) if re.search(r"token", ln, re.I)), None)
+        if idx is None:
+            idx = next((i for i, ln in enumerate(lines)
+                        if re.search(r"creature|artifact|enchantment|[\u2014\u2013]", ln, re.I)), None)
+        if idx is None:
+            continue
+        rest = [ln for ln in lines[idx + 1:] if not re.fullmatch(r"\W*[\d*]+\s*/\s*[\d*]+\W*", ln)]
+        found = (lines[idx], " ".join(rest))
+        if re.search(r"token", found[0], re.I):
+            return found
+        best = best if best[0] else found
+    return best
 
 
 def parse_pt(text):
@@ -1761,8 +1785,11 @@ def _recognize_token(cards, catalog, online, emit, sets, types, read_number):
     prepared = [enhance(c) for c in cards]
     card0 = prepared[0]
     name_reads = read_name_reads(prepared, None, treatments=2)
-    type_text, _ = read_region(card0, TYPE_BOX, raw=True)
-    rules_text, _ = read_region(card0, TEXT_BOX, 2.0)
+    type_text, rules_text = read_token_body(card0)
+    if not type_text:
+        type_text, _ = read_region(card0, TYPE_BOX, raw=True)
+        rules_text, _ = read_region(card0, TEXT_BOX, 2.0)
+    rules_text = clean_read(rules_text) if rules_text else ""
     pt_raw, _ = read_region(card0, PT_BOX, 3.0, raw=True, treatments=("contrast", "plain"))
     fields = {"type": type_text, "text": rules_text, "pt": parse_pt(pt_raw)}
     names = token_name_guesses(name_reads, type_text, types)
@@ -1811,9 +1838,11 @@ def _recognize_token(cards, catalog, online, emit, sets, types, read_number):
             for code, num in guesses[:2]:
                 if not num:
                     continue
-                found = next((m for m in ms if m["set_code"] == code and same_number(m["number"], num)), None)
+                tcode = "t" + code          # printed MID -> Scryfall token set TMID
+                found = next((m for m in ms if m["set_code"] in (code, tcode)
+                              and same_number(m["number"], num)), None)
                 if found is None:
-                    rec = card_by_set_number(code, num)
+                    rec = card_by_set_number(tcode, num) or card_by_set_number(code, num)
                     if rec and norm(rec["name"]) == norm(ms[0]["name"]):
                         img = fetch_small(rec.get("art_url", "")) if rec.get("art_url") else None
                         if img is not None:
@@ -1845,6 +1874,7 @@ def recognize(cards, catalog, debug_dir=None, online=True, emit=None, mode="stan
     Returns {"reads", "cands": [{name, final, ...}], "matches": printings or None, "notes",
     "mode" (what was actually used), "hit", "confirmed", "number_reads"}"""
     emit = emit or (lambda kind, value: None)
+    mode = str(mode).strip().lower()
     res, pre = None, {}
     if mode == "land" and cards:
         res, reads, prepared = _recognize_land(cards, catalog, online, emit, sets, read_number)
@@ -1885,7 +1915,7 @@ def save_debug(debug_dir, cards, reads, cands, res=None):
             lines += ["", f"Token fields: {res['fields']}"]
     (d / "result.txt").write_text("\n".join(lines), encoding="utf-8")
     if cards:   # the crops the reader looked at, to help tune where things are on a card
-        for name, box in (("collector", COLLECTOR_BOX), ("type", TYPE_BOX), ("text", TEXT_BOX), ("pt", PT_BOX)):
+        for name, box in (("collector", COLLECTOR_BOX), ("body", BODY_BOX), ("pt", PT_BOX)):
             try:
                 write_image(d / f"crop_{name}.jpg", _prep_strip(cards[0], box, 2.0))
             except Exception:
@@ -3482,7 +3512,7 @@ class ScannerApp:
         opt2 = ttk.Frame(cam, style="Panel.TFrame")
         opt2.pack(fill="x", pady=(8, 0))
         ttk.Label(opt2, text="Card type", style="PanelMuted.TLabel").pack(side="left", padx=(0, 8))
-        for text, val in CARD_MODES:
+        for val, text in CARD_MODES:
             ttk.Radiobutton(opt2, text=text, value=val, variable=self.card_mode,
                             style="Seg.Toolbutton", command=self.on_card_mode_change,
                             takefocus=0).pack(side="left", padx=(0, 2))
