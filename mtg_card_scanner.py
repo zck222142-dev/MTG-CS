@@ -305,39 +305,82 @@ def _parse_scryfall(c):
     }
 
 
+class ScryfallBusy(Exception):
+    """Scryfall asked us to slow down (or we are about to exceed its limits)."""
+
+    def __init__(self, seconds=30):
+        self.seconds = max(1, int(seconds))
+        super().__init__(f"Scryfall is busy - try again in about {self.seconds} seconds")
+
+
+# Scryfall allows 2 requests/second on search, named, random and collection and
+# 10/second on everything else. Going over gets you locked out for 30 seconds
+# (and repeat offenders get blocked), so EVERY call to api.scryfall.com goes
+# through this one polite gatekeeper, from every thread.
+SLOW_ENDPOINTS = ("/cards/search", "/cards/named", "/cards/random", "/cards/collection")
+SLOW_GAP, FAST_GAP = 0.6, 0.12       # seconds between calls (limits are 0.5 / 0.1)
+MAX_QUEUE_WAIT = 6.0                 # don't let a long line of calls pile up
+_gate = threading.Lock()
+_next_slot = {"slow": 0.0, "fast": 0.0}
+_blocked_until = 0.0
+
+
+def scryfall(method, path, **kwargs):
+    global _blocked_until
+    kind = "slow" if path.startswith(SLOW_ENDPOINTS) else "fast"
+    gap = SLOW_GAP if kind == "slow" else FAST_GAP
+    timeout = kwargs.pop("timeout", 15)
+    with _gate:
+        now = time.time()
+        if now < _blocked_until:
+            raise ScryfallBusy(_blocked_until - now + 1)
+        start = max(now, _next_slot[kind])
+        if start - now > MAX_QUEUE_WAIT:
+            raise ScryfallBusy(start - now)
+        _next_slot[kind] = start + gap
+    wait = start - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    r = requests.request(method, API + path, headers=HEADERS, timeout=timeout, **kwargs)
+    if r.status_code == 429:              # we were told to back off: do so for a while
+        with _gate:
+            _blocked_until = time.time() + 35
+        raise ScryfallBusy(35)
+    return r
+
+
+_PRINT_CACHE = {}
+
+
 def search_mtg(name):
     """Return a list of candidate printings from Scryfall."""
-    r = requests.get(
-        f"{API}/cards/search",
-        params={"q": f'!"{name}"', "unique": "prints", "order": "released"},
-        headers=HEADERS, timeout=12,
-    )
+    key = name.strip().lower()
+    if key in _PRINT_CACHE:                # asked before: no need to bother Scryfall again
+        return [dict(m) for m in _PRINT_CACHE[key]]
+    sort = {"unique": "prints", "order": "released"}
+    r = scryfall("GET", "/cards/search", params={"q": f'!"{name}"', **sort})
     if r.status_code == 404:  # no exact match -> try fuzzy (forgives typos)
-        r = requests.get(f"{API}/cards/named", params={"fuzzy": name},
-                         headers=HEADERS, timeout=12)
+        r = scryfall("GET", "/cards/named", params={"fuzzy": name})
         if r.status_code == 200:
             # re-search using the corrected name so we get every printing
             fixed = r.json().get("name", name)
-            r2 = requests.get(
-                f"{API}/cards/search",
-                params={"q": f'!"{fixed}"', "unique": "prints", "order": "released"},
-                headers=HEADERS, timeout=12,
-            )
+            r2 = scryfall("GET", "/cards/search", params={"q": f'!"{fixed}"', **sort})
             data = r2.json().get("data", []) if r2.status_code == 200 else [r.json()]
         else:
             # last resort: any card whose name contains the words we read
-            r3 = requests.get(
-                f"{API}/cards/search",
-                params={"q": name, "unique": "prints", "order": "released"},
-                headers=HEADERS, timeout=12,
-            )
+            r3 = scryfall("GET", "/cards/search", params={"q": name, **sort})
             if r3.status_code != 200:
                 return []
             data = r3.json().get("data", [])
     else:
         r.raise_for_status()
         data = r.json().get("data", [])
-    return [_parse_scryfall(c) for c in data[:15]]
+    out = [_parse_scryfall(c) for c in data[:15]]
+    if out:
+        if len(_PRINT_CACHE) > 60:
+            _PRINT_CACHE.clear()
+        _PRINT_CACHE[key] = [dict(m) for m in out]
+    return out
 
 
 def apply_finish(card, finish):
@@ -349,15 +392,23 @@ def apply_finish(card, finish):
 
 def card_by_name(name, exact=True):
     """One Scryfall card record for a name (or None)."""
-    r = requests.get(f"{API}/cards/named",
-                     params={"exact" if exact else "fuzzy": name},
-                     headers=HEADERS, timeout=12)
+    r = scryfall("GET", "/cards/named", params={"exact" if exact else "fuzzy": name})
     return r.json() if r.status_code == 200 else None
 
 
+def cards_by_names(names):
+    """Many cards in ONE request -> {card name: record}."""
+    names = list(dict.fromkeys(n for n in names if n))[:75]
+    if not names:
+        return {}
+    r = scryfall("POST", "/cards/collection", json={"identifiers": [{"name": n} for n in names]})
+    if r.status_code != 200:
+        return {}
+    return {c["name"]: c for c in r.json().get("data", [])}
+
+
 def scryfall_autocomplete(text):
-    r = requests.get(f"{API}/cards/autocomplete", params={"q": text},
-                     headers=HEADERS, timeout=12)
+    r = scryfall("GET", "/cards/autocomplete", params={"q": text})
     return r.json().get("data", []) if r.status_code == 200 else []
 
 
@@ -415,8 +466,6 @@ def read_variants(text):
 
 class NameCatalog:
     """Every Magic card name (from Scryfall), cached on disk, for fuzzy matching."""
-    URL = f"{API}/catalog/card-names"
-
     def __init__(self, path):
         self.path = Path(path)
         self.entries = []      # (normalised name, display name)
@@ -437,7 +486,7 @@ class NameCatalog:
             pass
         if not names or (age is not None and age > 14 * 86400):
             try:
-                r = requests.get(self.URL, headers=HEADERS, timeout=30)
+                r = scryfall("GET", "/catalog/card-names", timeout=60)
                 r.raise_for_status()
                 fresh = r.json().get("data", [])
                 if fresh:
@@ -737,7 +786,8 @@ def ocr_read_iter(card, treatments=4):
 
 def recognize(cards, catalog, debug_dir=None, online=True):
     """Work out which card this is. cards: straightened pictures, sharpest first.
-    Returns {"reads": [...], "cands": [{name, final, name_score, art_score, art_bytes}]}"""
+    Returns {"reads": [...], "cands": [{name, final, name_score, art_score, art_bytes}],
+    "notes": [problems worth telling the user about]}"""
     prepared = [enhance(c) for c in cards]
     reads, done = [], False
     deadline = time.time() + 14          # never make the user wait much longer than this
@@ -759,21 +809,21 @@ def recognize(cards, catalog, debug_dir=None, online=True):
         for text, conf in ocr_read_iter(cv2.rotate(prepared[0], cv2.ROTATE_180)):  # upside down?
             reads.append((text, conf))
 
+    notes = []
     scores = dict(catalog.rank(reads, limit=10)) if catalog.ready else {}
-    if reads and online:
+    if reads and online and (not catalog.ready or max(scores.values(), default=0.0) < 0.7):
         best_text = max(reads, key=lambda r: r[1])[0]
-        try:
+        try:   # the local name list is unsure (or not loaded yet): ask Scryfall too
+            if not catalog.ready:
+                for i, nm in enumerate(scryfall_autocomplete(best_text)[:6]):
+                    scores.setdefault(nm, 0.6 - 0.02 * i)
             hit = card_by_name(best_text, exact=False)
             if hit:
                 scores[hit["name"]] = max(scores.get(hit["name"], 0.0), 0.8)
+        except ScryfallBusy as e:
+            notes.append(str(e))
         except Exception:
             pass
-        if not catalog.ready:
-            try:
-                for i, nm in enumerate(scryfall_autocomplete(best_text)[:6]):
-                    scores.setdefault(nm, 0.6 - 0.02 * i)
-            except Exception:
-                pass
 
     ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:6]
     cands = [{"name": n, "name_score": s, "art_score": None, "final": s, "art_bytes": None}
@@ -781,10 +831,17 @@ def recognize(cards, catalog, debug_dir=None, online=True):
 
     if cands and online and prepared:      # compare artwork like a visual search would
         photo_art = art_region(prepared[0])
+        try:                               # ONE request covers every guess
+            recs = cards_by_names([c["name"] for c in cands])
+        except ScryfallBusy as e:
+            recs = {}
+            notes.append(str(e))
+        except Exception:
+            recs = {}
 
-        def look(c):
+        def look(c):                       # artwork files come from a server with no limits
             try:
-                rec = card_by_name(c["name"], exact=True)
+                rec = recs.get(c["name"])
                 if not rec:
                     return
                 blob = fetch_bytes(_art_url(rec))
@@ -796,8 +853,8 @@ def recognize(cards, catalog, debug_dir=None, online=True):
             except Exception:
                 return
 
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            list(ex.map(look, cands[:5]))
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(look, cands))
         for c in cands:
             if c["art_score"] is not None:
                 c["final"] = min(1.0, 0.65 * c["name_score"] + 0.35 * c["art_score"])
@@ -808,7 +865,7 @@ def recognize(cards, catalog, debug_dir=None, online=True):
             save_debug(debug_dir, cards, reads, cands)
         except Exception:
             pass
-    return {"reads": reads, "cands": cands}
+    return {"reads": reads, "cands": cands, "notes": notes}
 
 
 def save_debug(debug_dir, cards, reads, cands):
@@ -1083,14 +1140,17 @@ class AddCardDialog(tk.Toplevel):
         if val["reads"] and not self.name_var.get().strip():
             self.name_var.set(max(val["reads"], key=lambda r: r[1])[0])
         if self.cands and self.cands[0]["final"] >= 0.5:
-            self.msg_var.set(f"Best guess: {self.cands[0]['name']}. Not right? "
-                             "Pick another below, or type the name.")
+            msg = (f"Best guess: {self.cands[0]['name']}. Not right? "
+                   "Pick another below, or type the name.")
             self.cand_tree.selection_set("0")
         elif self.cands:
-            self.msg_var.set("Not sure about this one - check the guesses, or type the name.")
+            msg = "Not sure about this one - check the guesses, or type the name."
         else:
-            self.msg_var.set("Couldn't read this card clearly. Type a few letters of the "
-                             "name - suggestions appear as you type.")
+            msg = ("Couldn't read this card clearly. Type a few letters of the "
+                   "name - suggestions appear as you type.")
+        if val.get("notes"):
+            msg += "  (Scryfall asked us to slow down, so artwork previews are missing for now.)"
+        self.msg_var.set(msg)
 
     # ------------------------------------------------------------ guesses list
     def _show_candidates(self, cands):
@@ -1179,8 +1239,13 @@ class AddCardDialog(tk.Toplevel):
             return
         if not ok:
             self.matches = []
-            self.msg_var.set("Couldn't reach Scryfall - check your internet connection. "
-                             "You can still add the card with a custom value.")
+            self.loaded_name = ""
+            if isinstance(val, ScryfallBusy):
+                self.msg_var.set(f"Scryfall asked us to slow down. Wait about {val.seconds} "
+                                 "seconds, then press Search.")
+            else:
+                self.msg_var.set("Couldn't reach Scryfall - check your internet connection. "
+                                 "You can still add the card with a custom value.")
             return
         self.matches = val
         self._fill_printings(val)
