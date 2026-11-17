@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+# Lets the build publish a release (the in-app "Update" button downloads from it).
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -15,22 +19,46 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Work out the version number
+        id: ver
+        shell: bash
+        run: |
+          base=$(python -c "import re;print(re.search(r'APP_BASE_VERSION\s*=\s*\"([^\"]+)\"', open('mtg_card_scanner.py', encoding='utf-8').read()).group(1))")
+          echo "version=${base}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Record the version and repository inside the app
+        shell: bash
+        run: |
+          printf 'version=%s\nrepo=%s\n' "${{ steps.ver.outputs.version }}" "${{ github.repository }}" > build_info.txt
+          cat build_info.txt
+
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
       - name: Build the app
-        run: python -m PyInstaller --noconfirm --windowed --name "MTG Card Scanner" --collect-all rapidocr_onnxruntime mtg_card_scanner.py
+        run: python -m PyInstaller --noconfirm --windowed --name "MTG Card Scanner" --collect-all rapidocr_onnxruntime --collect-all sv_ttk --collect-all rapidfuzz --add-data "build_info.txt;." mtg_card_scanner.py
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
       - name: Build the installer
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ steps.ver.outputs.version }} installer.iss
 
       - uses: actions/upload-artifact@v4
         with:
           name: MTG-Card-Scanner-Installer
           path: installer_output/MTG-Card-Scanner-Setup.exe
+
+      - name: Publish a release (what the in-app Update button looks for)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.ver.outputs.version }}"
+          gh release create "$tag" installer_output/MTG-Card-Scanner-Setup.exe \
+            --title "MTG Card Scanner ${{ steps.ver.outputs.version }}" \
+            --notes "Automatic build of commit ${GITHUB_SHA::7}. Download MTG-Card-Scanner-Setup.exe and run it, or use the Update button inside the app." \
+            --latest
