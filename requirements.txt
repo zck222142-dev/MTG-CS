@@ -2,3 +2,6 @@ opencv-python
 requests
 pillow
 rapidocr_onnxruntime
+rapidfuzz
+sv-ttk
+cryptography
