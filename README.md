@@ -1,4 +1,4 @@
-[README (3).md](https://github.com/user-attachments/files/34996040/README.3.md)
+[README (4).md](https://github.com/user-attachments/files/35001309/README.4.md)
 # MTG Card Scanner
 
 A Windows desktop app that identifies Magic: The Gathering cards from a webcam or a phone
@@ -73,7 +73,42 @@ blurs it. It only ever *adds* to the evidence: a matching number nudges that car
 (more strongly for lands and tokens), and when it matches, the app says so and selects that
 printing for you. A number that doesn't fit the name, artwork or text never overrides them.
 If it can't be read, nothing is lost. Turn it off in **Settings > General** if it slows you down.
+
+**Read the set code first** (also in Settings): when the picture is sharp, the app reads the code
+before anything else. A real set and number names the exact printing in one quick lookup, so the
+slower steps are skipped, which can make scanning faster. The title is still read once and has to
+agree, so a misread number can't slip through. **Turn it off if your camera is low pixel count or
+blurry**; the app also checks the small print is sharp enough and falls back by itself.
 For big batches, you can also type `MOM 275` into the name box.
+
+### When scanned: Add, Find or Commander
+The **When scanned** switch (key **S** cycles it) decides what a scan does:
+
+- **Add to deck** - the normal thing: confirm the card and it is added to the deck you are showing.
+- **Find a card** - scan a card to see which decks it is in, how many copies you have in each,
+  and its usual details (type, rarity, prices). An exact match on printing is marked with `*`.
+  **Go to deck** jumps to that deck and selects the card.
+- **Commander's deck** - scan a deck's commander and the app takes you straight to that deck.
+  To set one up, open the deck, click a card and press **Commander** (key **C**). A deck can
+  have one commander or two (partners); they are marked with a star in the list. If two decks
+  share a commander, you choose between them. Pressing Commander again removes it.
+
+Find and Commander don't change your decks. You still confirm which card it is first.
+
+### Batch mode: many cards in one photo
+Switch **Capture** to **Batch** (key **B**).
+
+1. Spread the cards out on a plain table, **not touching**. Card borders are black, so a
+   **light table works best** and a black one worst. Keep them all in the camera view in good light.
+2. Press **Snap** once (or use **Photo file...** / the phone link with a picture of the table).
+3. The app cuts each card out and reads them all (you can press **Stop reading**).
+4. Then you confirm them one at a time, like normal. Cards it **can't tell go to the back of
+   the line**, and you can also press **Set aside** on any card to do it last.
+
+Tips and limits: aim for 6 to 9 cards per photo on a 1080p webcam; more cards means each one is
+smaller, and small cards read worse. The phone camera gives a sharper picture. Batch mode only
+adds cards, so set **When scanned** to **Add to deck**. It uses the Card type setting for every card
+in the photo, so keep lands and tokens in their own batches.
 
 ### Auto mode
 Switch **Capture** from *Manual* to *Auto*. When the card is sharp and held still for about a
@@ -144,7 +179,7 @@ Click **Settings** (or press **Ctrl+comma**).
 - **Scanning:** how long Auto waits, and how sharp the picture must be before it counts as
   ready. The small `focus` number under the camera shows what your camera reaches.
 - **Keys:** every action can have its own key. Defaults: Space snap, A switch Manual/Auto,
-  Ctrl+N new deck, D next deck, T switch Non-foil/Foil for new scans, M switch Standard/Land/Token, P phone, O photo file, N add by name or number,
+  S scan action, B batch mode, C commander, Ctrl+N new deck, D next deck, T switch Non-foil/Foil for new scans, M switch Standard/Land/Token, P phone, O photo file, N add by name or number,
   + and - change quantity, F switch foil, Delete remove, Ctrl+E export view, Ctrl+Q exit.
   Single-letter keys are ignored while you are typing in a box.
 
