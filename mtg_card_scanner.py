@@ -36,7 +36,9 @@ import heapq
 import io
 import json
 import os
+import math
 import queue
+import random
 import re
 import secrets
 import shutil
@@ -54,7 +56,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, colorchooser
 
 import cv2
 import numpy as np
@@ -121,7 +123,7 @@ BOX_HEIGHT_FRACTION = 0.92           # size of the guide frame
 # Version. The installer build (GitHub Actions) writes build_info.txt next to the app with
 # the full version (for example 1.3.27) and the name of your GitHub repository, so the
 # app knows what it is and where to look for updates. Running from source: version x.y.0.
-APP_BASE_VERSION = "1.5"
+APP_BASE_VERSION = "1.6"
 
 
 def app_dir():
@@ -302,10 +304,226 @@ C = dict(bg="#13151b", panel="#1b1e27", panel2="#252938", hover="#2f3548",
          accent_hi="#8aa2ff", accent_lo="#5671d6", good="#38d996",
          warn="#ffb547", bad="#ff6b6b", gold="#ffd479", stripe="#1f232d")
 UI_FONT = "Segoe UI" if os.name == "nt" else "TkDefaultFont"
+FONT_SCALE = 1.0
+ROW_HEIGHT = 30
+BASE_C = dict(C, on_accent="#ffffff")
 
 
 def F(size=10, weight="normal"):
-    return (UI_FONT, size, weight)
+    return (UI_FONT, max(7, int(round(size * FONT_SCALE))), weight)
+
+
+# ------------------------------------------------------------ looks: themes, art, motion
+THEMES = {
+    "Midnight": {},
+    "Plains": dict(bg="#17150f", panel="#221f16", panel2="#2f2b1f", hover="#3b3627", line="#443e2c",
+                   accent="#d9b45a", accent_hi="#e7c777", accent_lo="#b8923c", stripe="#1d1a12",
+                   gold="#fff1c2"),
+    "Island": dict(bg="#0e1620", panel="#142130", panel2="#1c2e43", hover="#25405c", line="#2a4059",
+                   accent="#4aa3e8", accent_hi="#6fb8f0", accent_lo="#3586c4", stripe="#111d2a"),
+    "Swamp": dict(bg="#120f16", panel="#1b1621", panel2="#271f30", hover="#352a41", line="#3a2d48",
+                  accent="#9b6bd1", accent_hi="#b184e0", accent_lo="#7d52ae", stripe="#16121b"),
+    "Mountain": dict(bg="#18110f", panel="#231915", panel2="#33231d", hover="#44302a", line="#533a31",
+                     accent="#e0643c", accent_hi="#ef7f58", accent_lo="#bd4a26", stripe="#1d1512"),
+    "Forest": dict(bg="#0f1611", panel="#16211a", panel2="#1f3025", hover="#2a4332", line="#2f4a37",
+                   accent="#4cb86a", accent_hi="#6fcb89", accent_lo="#369552", stripe="#121b15"),
+    "High contrast": dict(bg="#000000", panel="#0a0a0a", panel2="#1a1a1a", hover="#333333",
+                          line="#8a8a8a", text="#ffffff", muted="#d0d0d0", accent="#ffd400",
+                          accent_hi="#ffe45c", accent_lo="#c9a600", stripe="#101010", gold="#ffd400"),
+}
+THEME_NAMES = list(THEMES)
+TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15}
+ROW_HEIGHTS = {"Compact": 24, "Normal": 30, "Roomy": 38}
+ART_MODES = [("theme", "Theme art"), ("none", "No art"), ("custom", "My picture")]
+LOOK_DEFAULTS = {"theme": "Midnight", "accent": "", "art": "theme", "art_path": "", "art_dim": 45,
+                 "animations": True, "anim_speed": "Normal", "text_size": "Normal", "rows": "Normal",
+                 "sound": False}
+PARTICLE_STYLES = {"Midnight": "twinkle", "Plains": "motes", "Island": "bubbles", "Swamp": "mist",
+                   "Mountain": "embers", "Forest": "fireflies", "High contrast": None}
+
+
+def _rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def mix(a, b, t):
+    """Colour a blended toward colour b by t (0..1)."""
+    return _hex([x + (y - x) * t for x, y in zip(_rgb(a), _rgb(b), strict=True)])
+
+
+def luminance(h):
+    r, g, b = (v / 255.0 for v in _rgb(h))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def valid_hex(text):
+    return isinstance(text, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", text) is not None
+
+
+def theme_palette(name, accent=None):
+    """The full colour set for a theme, optionally with the person's own accent colour."""
+    p = dict(BASE_C)
+    p.update(THEMES.get(name, {}))
+    if valid_hex(accent):
+        p["accent"] = accent.lower()
+        p["accent_hi"] = mix(accent, "#ffffff", 0.25)
+        p["accent_lo"] = mix(accent, "#000000", 0.2)
+    p["on_accent"] = "#0d1117" if luminance(p["accent"]) > 0.55 else "#ffffff"
+    return p
+
+
+def apply_palette(palette):
+    """Switch the app's colours. Returns the colours that were in use."""
+    old = dict(C)
+    C.update(palette)
+    return old
+
+
+def load_look(settings):
+    """Appearance settings from settings.json, with anything odd replaced by the default."""
+    raw = settings.get("look") if isinstance(settings, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    look = dict(LOOK_DEFAULTS)
+    if raw.get("theme") in THEMES:
+        look["theme"] = raw["theme"]
+    if valid_hex(raw.get("accent")):
+        look["accent"] = raw["accent"].lower()
+    if raw.get("art") in dict(ART_MODES):
+        look["art"] = raw["art"]
+    if isinstance(raw.get("art_path"), str):
+        look["art_path"] = raw["art_path"]
+    look["art_dim"] = int(_num(raw.get("art_dim", 45), 45, 0, 80))
+    for k in ("animations", "sound"):
+        if isinstance(raw.get(k), bool):
+            look[k] = raw[k]
+    if raw.get("anim_speed") in ("Calm", "Normal"):
+        look["anim_speed"] = raw["anim_speed"]
+    if raw.get("text_size") in TEXT_SIZES:
+        look["text_size"] = raw["text_size"]
+    if raw.get("rows") in ROW_HEIGHTS:
+        look["rows"] = raw["rows"]
+    return look
+
+
+def set_look_globals(look):
+    global FONT_SCALE, ROW_HEIGHT
+    FONT_SCALE = TEXT_SIZES[look["text_size"]]
+    ROW_HEIGHT = ROW_HEIGHTS[look["rows"]]
+
+
+_COLOR_OPTS = ("bg", "background", "fg", "foreground", "activebackground", "activeforeground",
+               "highlightbackground", "highlightcolor", "insertbackground", "selectbackground",
+               "troughcolor", "disabledforeground")
+
+
+def recolor_widgets(root, old, new):
+    """Give every plain-tk widget the new colours (ttk widgets follow their style on their own)."""
+    table = {}
+    for k, v in old.items():
+        if k in new and isinstance(v, str) and v.startswith("#") and v.lower() != str(new[k]).lower():
+            table.setdefault(v.lower(), new[k])
+    changed, stack = 0, [root]
+    while stack:
+        w = stack.pop()
+        try:
+            stack.extend(w.winfo_children())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if isinstance(w, ttk.Widget):
+                continue
+        except Exception:  # noqa: BLE001 - no ttk.Widget to compare with
+            pass
+        for opt in _COLOR_OPTS:
+            try:
+                cur = str(w.cget(opt)).lower()
+            except Exception:  # noqa: BLE001
+                continue
+            if cur in table:
+                try:
+                    w.configure(**{opt: table[cur]})
+                    changed += 1
+                except Exception:  # noqa: BLE001
+                    pass
+    return changed
+
+
+def banner_image(w, h, palette, theme="Midnight", custom=None, dim=0.45):
+    """The header artwork as an RGB array: soft coloured glows for the theme, or the person's
+    own picture (cropped to fit and darkened so the text stays readable)."""
+    w, h = max(2, int(w)), max(2, int(h))
+    bg = np.array(_rgb(palette["bg"]), float)
+    xx, yy = np.meshgrid(np.arange(w, dtype=float), np.arange(h, dtype=float))
+    if custom is not None:
+        ih, iw = custom.shape[:2]
+        sc = max(w / iw, h / ih)
+        big = cv2.resize(custom, (max(w, int(iw * sc + 0.5)), max(h, int(ih * sc + 0.5))), interpolation=cv2.INTER_AREA)
+        y0, x0 = (big.shape[0] - h) // 2, (big.shape[1] - w) // 2
+        img = big[y0:y0 + h, x0:x0 + w, ::-1].astype(float)
+        img = img * (1 - dim) + bg * dim
+    else:
+        panel2 = np.array(_rgb(palette["panel2"]), float)
+        t = (yy / max(1, h - 1))[..., None]
+        img = bg * (1 - t) + panel2 * t * 0.7
+        rnd = np.random.default_rng(sum(ord(c) for c in theme))
+        cols = [np.array(_rgb(palette["accent"]), float), np.array(_rgb(palette["accent_hi"]), float)]
+        for i in range(5):
+            cx, cy = rnd.uniform(0.3, 1.0) * w, rnd.uniform(0.05, 0.95) * h
+            r = rnd.uniform(0.07, 0.2) * w
+            g = np.exp(-(((xx - cx) ** 2) / (2 * r * r) + ((yy - cy) ** 2) / (2 * (0.5 * r) ** 2)))[..., None]
+            k = rnd.uniform(0.25, 0.5) * (0.55 if theme == "High contrast" else 1.0)
+            img = img * (1 - g * k) + cols[i % 2] * g * k
+    left = np.clip(0.6 + 0.4 * (xx / (0.45 * w)), 0.6, 1.0)[..., None]          # keeps the title readable
+    edge = np.clip(1.0 - 0.35 * (np.abs(xx / w - 0.5) * 2) ** 3, 0.65, 1.0)[..., None]
+    return np.clip(img * left * edge, 0, 255).astype(np.uint8)
+
+
+def make_particles(w, h, n=34, seed=1):
+    rnd = random.Random(seed)
+    return [{"x": rnd.uniform(0, w), "y": rnd.uniform(0, h), "r": rnd.uniform(1.2, 3.0),
+             "ph": rnd.uniform(0, 6.28), "sp": rnd.uniform(0.6, 1.4)} for _ in range(n)]
+
+
+def step_particles(parts, w, h, dt, style):
+    vel = {"embers": (6, -30), "bubbles": (0, -14), "motes": (3, -6), "mist": (14, 0),
+           "fireflies": (0, 0), "twinkle": (0, 0)}.get(style, (0, 0))
+    for p in parts:
+        p["ph"] += dt * p["sp"] * (2.5 if style in ("twinkle", "fireflies") else 1.0)
+        dx, dy = vel
+        if style == "fireflies":
+            dx, dy = math.sin(p["ph"] * 0.7) * 12, math.cos(p["ph"] * 0.5) * 8
+        elif style == "embers":
+            dx += math.sin(p["ph"] * 2) * 8
+        p["x"] += dx * p["sp"] * dt
+        p["y"] += dy * p["sp"] * dt
+        if p["x"] > w + 5:
+            p["x"] = -5.0
+        elif p["x"] < -5:
+            p["x"] = w + 5.0
+        if p["y"] < -5:
+            p["y"] = h + 5.0
+        elif p["y"] > h + 5:
+            p["y"] = -5.0
+
+
+def particle_color(p, style, palette):
+    base = {"embers": "#ff9a52", "bubbles": "#9fd4ff", "motes": "#fff0b8", "mist": "#b79cd8",
+            "fireflies": "#c8ff8a"}.get(style, palette["accent_hi"])
+    b = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(p["ph"]))
+    return mix(palette["bg"], base, 0.9 * b)
+
+
+def play_scan_sound():
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_OK)
+    except Exception:  # noqa: BLE001 - no sound is fine
+        pass
 
 
 def apply_theme(root):
@@ -335,7 +553,7 @@ def apply_theme(root):
     s.map("TButton",
           background=[("disabled", C["panel"]), ("pressed", C["line"]), ("active", C["hover"])],
           foreground=[("disabled", C["muted"])])
-    s.configure("Accent.TButton", background=C["accent"], foreground="#ffffff",
+    s.configure("Accent.TButton", background=C["accent"], foreground=C["on_accent"],
                 font=F(11, "bold"), padding=(14, 12))
     s.map("Accent.TButton",
           background=[("disabled", C["line"]), ("pressed", C["accent_lo"]),
@@ -351,7 +569,7 @@ def apply_theme(root):
                 padding=(18, 8), borderwidth=0, relief="flat", anchor="center")
     s.map("Seg.Toolbutton",
           background=[("selected", C["accent"]), ("active", C["hover"])],
-          foreground=[("selected", "#ffffff"), ("active", C["text"])])
+          foreground=[("selected", C["on_accent"]), ("active", C["text"])])
 
     for w in ("TCheckbutton", "TRadiobutton"):
         s.configure(w, background=C["panel"], foreground=C["text"],
@@ -374,7 +592,7 @@ def apply_theme(root):
     root.option_add("*TCombobox*Listbox.background", C["panel2"])
     root.option_add("*TCombobox*Listbox.foreground", C["text"])
     root.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
-    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+    root.option_add("*TCombobox*Listbox.selectForeground", C["on_accent"])
     root.option_add("*TCombobox*Listbox.font", F(10))
 
     for w in ("TEntry", "TSpinbox"):
@@ -386,9 +604,9 @@ def apply_theme(root):
               lightcolor=[("focus", C["accent"])], darkcolor=[("focus", C["accent"])])
 
     s.configure("Treeview", background=C["panel"], fieldbackground=C["panel"],
-                foreground=C["text"], rowheight=30, borderwidth=0, relief="flat", font=F(10))
+                foreground=C["text"], rowheight=ROW_HEIGHT, borderwidth=0, relief="flat", font=F(10))
     s.map("Treeview", background=[("selected", C["accent"])],
-          foreground=[("selected", "#ffffff")])
+          foreground=[("selected", C["on_accent"])])
     s.configure("Treeview.Heading", background=C["panel2"], foreground=C["muted"],
                 relief="flat", borderwidth=0, padding=(8, 8), font=F(9, "bold"))
     s.map("Treeview.Heading", background=[("active", C["hover"])])
@@ -405,7 +623,7 @@ def apply_theme(root):
     s.configure("TNotebook.Tab", background=C["panel2"], foreground=C["muted"],
                 padding=(18, 9), borderwidth=0)
     s.map("TNotebook.Tab", background=[("selected", C["accent"]), ("active", C["hover"])],
-          foreground=[("selected", "#ffffff"), ("active", C["text"])])
+          foreground=[("selected", C["on_accent"]), ("active", C["text"])])
     s.configure("Horizontal.TProgressbar", troughcolor=C["panel2"], background=C["accent"],
                 bordercolor=C["panel"], lightcolor=C["accent"], darkcolor=C["accent"])
 
@@ -2839,9 +3057,142 @@ class PhoneLink:
 def stat_tile(parent, caption):
     f = ttk.Frame(parent, style="Panel.TFrame", padding=(18, 10))
     var = tk.StringVar(value="0")
-    ttk.Label(f, textvariable=var, style="StatNum.TLabel").pack(anchor="w")
+    f.num = ttk.Label(f, textvariable=var, style="StatNum.TLabel")
+    f.num.pack(anchor="w")
     ttk.Label(f, text=caption, style="StatCap.TLabel").pack(anchor="w")
     return f, var
+
+
+class Banner:
+    """The header: artwork behind the title, the totals and the buttons, with optional slow motion."""
+    HEIGHT = 112
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.root = app.root
+        self.canvas = tk.Canvas(parent, height=self.HEIGHT, highlightthickness=0, bd=0, bg=C["bg"])
+        self.bg_item = self.canvas.create_image(0, 0, anchor="nw")
+        self.title_item = self.canvas.create_text(24, 40, anchor="w", text="MTG Card Scanner",
+                                                  fill=C["text"], font=F(19, "bold"))
+        self.sub_item = self.canvas.create_text(
+            24, 72, anchor="w", fill=C["muted"], font=F(10),
+            text=f"Scan, price and sort your Magic cards   -   version {APP_VERSION}")
+        self.items = []              # (widget, gap after it, canvas window id)
+        self.w = 0
+        self.photo = None
+        self.custom = None
+        self.custom_path = None
+        self.parts, self.dots = [], []
+        self.running = False
+        self.last = time.time()
+        self._resize_job = None
+        self.canvas.bind("<Configure>", self._on_resize)
+
+    def set_right(self, items):
+        """items: [(widget, gap after)] placed right to left along the right edge."""
+        for wd, gap in items:
+            wid = self.canvas.create_window(0, self.HEIGHT // 2, window=wd, anchor="e")
+            self.items.append((wd, gap, wid))
+        self.layout()
+
+    def layout(self):
+        w = self.w or self.canvas.winfo_width()
+        x = w - 22
+        for wd, gap, wid in reversed(self.items):
+            self.canvas.coords(wid, x, self.HEIGHT // 2)
+            try:
+                x -= wd.winfo_reqwidth() + gap
+            except Exception:  # noqa: BLE001
+                x -= 100
+
+    def _on_resize(self, e):
+        if self._resize_job:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self.w = int(getattr(e, "width", 0) or 0)
+        self.layout()
+        self._resize_job = self.root.after(90, self.refresh)
+
+    def _custom_image(self, path):
+        if not path:
+            return None
+        if path != self.custom_path:
+            self.custom_path = path
+            try:
+                self.custom = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
+            except Exception:  # noqa: BLE001
+                self.custom = None
+        return self.custom
+
+    def refresh(self):
+        """Redraw the artwork and colours (after a resize or a settings change)."""
+        look = self.app.look
+        w = int(self.w or self.canvas.winfo_width() or 0)
+        self.canvas.configure(bg=C["bg"])
+        self.canvas.itemconfigure(self.title_item, fill=C["text"], font=F(19, "bold"))
+        self.canvas.itemconfigure(self.sub_item, fill=C["muted"], font=F(10))
+        if w > 20:
+            art = look["art"]
+            if art == "none":
+                img = banner_image(w, self.HEIGHT, dict(C, panel2=C["bg"], accent=C["bg"], accent_hi=C["bg"]), "None")
+            elif art == "custom" and self._custom_image(look["art_path"]) is not None:
+                img = banner_image(w, self.HEIGHT, C, look["theme"], self.custom, look["art_dim"] / 100.0)
+            else:
+                img = banner_image(w, self.HEIGHT, C, look["theme"])
+            self.photo = ImageTk.PhotoImage(Image.fromarray(img))
+            self.canvas.itemconfigure(self.bg_item, image=self.photo)
+            self.canvas.tag_lower(self.bg_item)
+        self.set_animation()
+
+    def set_animation(self):
+        look = self.app.look
+        style = PARTICLE_STYLES.get(look["theme"])
+        w = int(self.w or self.canvas.winfo_width() or 0)
+        want = bool(look["animations"] and style and look["art"] != "none" and w > 20)
+        for d in self.dots:
+            self.canvas.delete(d)
+        self.dots = []
+        self.style = style
+        if not want:
+            self.running = False
+            return
+        self.parts = make_particles(w, self.HEIGHT, 34, seed=sum(ord(c) for c in look["theme"]))
+        for _ in self.parts:
+            self.dots.append(self.canvas.create_oval(0, 0, 1, 1, outline="", fill=C["bg"]))
+        self._draw_particles()
+        if not self.running:
+            self.running = True
+            self.last = time.time()
+            self.root.after(80, self._tick)
+
+    def _draw_particles(self):
+        for p, d in zip(self.parts, self.dots, strict=False):
+            r = p["r"]
+            self.canvas.coords(d, p["x"] - r, p["y"] - r, p["x"] + r, p["y"] + r)
+            self.canvas.itemconfigure(d, fill=particle_color(p, self.style, C))
+
+    def _tick(self):
+        if not self.running:
+            return
+        look = self.app.look
+        calm = look["anim_speed"] == "Calm"
+        try:
+            hidden = self.root.state() == "iconic" or not self.canvas.winfo_viewable()
+        except Exception:  # noqa: BLE001
+            hidden = False
+        now = time.time()
+        dt = min(0.25, now - self.last) * (0.5 if calm else 1.0)
+        self.last = now
+        if not hidden:
+            try:
+                step_particles(self.parts, self.w or 1000, self.HEIGHT, dt, self.style)
+                self._draw_particles()
+            except Exception:  # noqa: BLE001 - a drawing hiccup must never stop the app
+                self.running = False
+                return
+        self.root.after(500 if hidden else (100 if calm else 66), self._tick)
 
 
 def hex_to_bgr(h):
@@ -3686,8 +4037,8 @@ class SettingsWindow(tk.Toplevel):
         outer.pack(fill="both", expand=True)
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True)
-        for title, build in (("General", self._general), ("Scanning", self._scanning),
-                             ("Keys", self._keys)):
+        for title, build in (("General", self._general), ("Appearance", self._appearance),
+                             ("Scanning", self._scanning), ("Keys", self._keys)):
             page = ttk.Frame(nb, style="Panel.TFrame", padding=18)
             nb.add(page, text=title)
             build(page)
@@ -3740,6 +4091,117 @@ class SettingsWindow(tk.Toplevel):
         ttk.Button(row, text="Check for updates now", command=self._check).pack(side="left")
         ttk.Button(row, text="Read me", command=self.app.open_readme).pack(side="left", padx=8)
         ttk.Button(row, text="My files", command=lambda: open_folder(DATA_DIR)).pack(side="left")
+
+    def _appearance(self, f):
+        app = self.app
+        look = app.look
+        P = "Panel.TLabel"
+        self.look_vars = {
+            "theme": tk.StringVar(value=look["theme"]),
+            "art": tk.StringVar(value=look["art"]),
+            "art_dim": tk.IntVar(value=look["art_dim"]),
+            "animations": tk.BooleanVar(value=look["animations"]),
+            "anim_speed": tk.StringVar(value=look["anim_speed"]),
+            "text_size": tk.StringVar(value=look["text_size"]),
+            "rows": tk.StringVar(value=look["rows"]),
+            "sound": tk.BooleanVar(value=look["sound"]),
+        }
+        v = self.look_vars
+
+        def combo(row, label, key, values):
+            ttk.Label(row, text=label, style=P).pack(side="left", padx=(0, 8))
+            cb = ttk.Combobox(row, textvariable=v[key], values=values, state="readonly", width=14)
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda e: (app.set_look(**{key: v[key].get()}), self._swatches()))
+            return cb
+
+        r = ttk.Frame(f, style="Panel.TFrame")
+        r.pack(fill="x")
+        combo(r, "Theme", "theme", THEME_NAMES)
+        self.swatch = tk.Canvas(r, width=120, height=18, highlightthickness=0, bg=C["panel"])
+        self.swatch.pack(side="left", padx=12)
+        self._swatches()
+
+        r = ttk.Frame(f, style="Panel.TFrame")
+        r.pack(fill="x", pady=(10, 0))
+        ttk.Button(r, text="Accent colour...", command=self._pick_accent).pack(side="left")
+        ttk.Button(r, text="Use the theme's", command=lambda: (app.set_look(accent=""), self._swatches())
+                   ).pack(side="left", padx=8)
+
+        ttk.Label(f, text="Header artwork", style=P).pack(anchor="w", pady=(14, 2))
+        r = ttk.Frame(f, style="Panel.TFrame")
+        r.pack(fill="x")
+        for val, text in ART_MODES:
+            ttk.Radiobutton(r, text=text, value=val, variable=v["art"], style="Seg.Toolbutton",
+                            command=lambda: app.set_look(art=v["art"].get()), takefocus=0
+                            ).pack(side="left", padx=(0, 2))
+        ttk.Button(r, text="Choose picture...", command=self._pick_art).pack(side="left", padx=10)
+        r = ttk.Frame(f, style="Panel.TFrame")
+        r.pack(fill="x", pady=(6, 0))
+        ttk.Label(r, text="Darken my picture", style=P).pack(side="left", padx=(0, 8))
+        ttk.Scale(r, from_=0, to=80, variable=v["art_dim"], orient="horizontal", length=180,
+                  command=lambda x: self._dim_changed()).pack(side="left")
+
+        ttk.Label(f, text="Motion", style=P).pack(anchor="w", pady=(14, 2))
+        r = ttk.Frame(f, style="Panel.TFrame")
+        r.pack(fill="x")
+        ttk.Checkbutton(r, text="Animations (drifting lights in the header, totals flash on add)",
+                        variable=v["animations"],
+                        command=lambda: app.set_look(animations=bool(v["animations"].get()))
+                        ).pack(side="left")
+        r = ttk.Frame(f, style="Panel.TFrame")
+        r.pack(fill="x", pady=(6, 0))
+        combo(r, "Speed", "anim_speed", ["Calm", "Normal"])
+        ttk.Label(f, style="PanelMuted.TLabel", wraplength=460, justify="left", text=(
+            "Animations pause by themselves while the window is minimised. Turn them off on a slow "
+            "computer. The scanner itself is not affected either way.")).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(f, text="Layout", style=P).pack(anchor="w", pady=(14, 2))
+        r = ttk.Frame(f, style="Panel.TFrame")
+        r.pack(fill="x")
+        combo(r, "List rows", "rows", list(ROW_HEIGHTS))
+        ttk.Label(r, text="   ", style=P).pack(side="left")
+        combo(r, "Text size", "text_size", list(TEXT_SIZES))
+        ttk.Label(f, style="PanelMuted.TLabel", text="Text size applies the next time the app starts."
+                  ).pack(anchor="w", pady=(2, 0))
+        ttk.Checkbutton(f, text="Play a soft sound when a card is added", variable=v["sound"],
+                        command=lambda: app.set_look(sound=bool(v["sound"].get()))
+                        ).pack(anchor="w", pady=(10, 0))
+        ttk.Button(f, text="Reset appearance", command=self._reset_look).pack(anchor="w", pady=(12, 0))
+
+    def _swatches(self):
+        try:
+            self.swatch.delete("all")
+            for i, k in enumerate(("bg", "panel2", "accent", "accent_hi", "good", "gold")):
+                self.swatch.create_rectangle(i * 20, 0, i * 20 + 18, 18, fill=C[k], outline=C["line"])
+        except tk.TclError:
+            pass
+
+    def _pick_accent(self):
+        got = colorchooser.askcolor(color=C["accent"], parent=self, title="Accent colour")
+        if got and valid_hex(got[1]):
+            self.app.set_look(accent=got[1].lower())
+            self._swatches()
+
+    def _pick_art(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Choose a picture for the header",
+            filetypes=[("Pictures", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")])
+        if path:
+            self.look_vars["art"].set("custom")
+            self.app.set_look(art="custom", art_path=path)
+
+    def _dim_changed(self):
+        job = getattr(self, "_dim_job", None)
+        if job:
+            self.after_cancel(job)
+        self._dim_job = self.after(200, lambda: self.app.set_look(art_dim=int(self.look_vars["art_dim"].get())))
+
+    def _reset_look(self):
+        self.app.reset_look()
+        for k, var in self.look_vars.items():
+            var.set(self.app.look[k])
+        self._swatches()
 
     def _check(self):
         self._save_repo()
@@ -3958,11 +4420,15 @@ class ScannerApp:
             root.geometry("1380x800")
         root.minsize(1180, 640)
         ensure_dirs()
-        apply_theme(root)
-        start_ocr_warmup()                 # everything slow loads in the background
         self.settings = load_json(SETTINGS_FILE, {})
         if not isinstance(self.settings, dict):
             self.settings = {}
+        self.look = load_look(self.settings)
+        set_look_globals(self.look)
+        apply_palette(theme_palette(self.look["theme"], self.look["accent"]))
+        apply_theme(root)
+        start_ocr_warmup()                 # everything slow loads in the background
+        self.banner = None
         saved_keys = self.settings.get("keys", {})
         self.keys = dict(DEFAULT_KEYS)
         if isinstance(saved_keys, dict):
@@ -4047,23 +4513,17 @@ class ScannerApp:
         root.rowconfigure(1, weight=1)
 
         # ---- header
-        head = ttk.Frame(root, padding=(22, 14, 22, 4))
-        head.grid(row=0, column=0, columnspan=2, sticky="ew")
-        head.columnconfigure(0, weight=1)
-        titles = ttk.Frame(head)
-        titles.grid(row=0, column=0, sticky="w")
-        ttk.Label(titles, text="MTG Card Scanner", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(titles, text=f"Scan, price and sort your Magic cards   -   version {APP_VERSION}",
-                  style="Muted.TLabel").pack(anchor="w")
+        self.banner = Banner(root, self)
+        self.banner.canvas.grid(row=0, column=0, columnspan=2, sticky="ew")
+        head = self.banner.canvas
         tiles = ttk.Frame(head)
-        tiles.grid(row=0, column=1, sticky="e")
         t1, self.tile_count = stat_tile(tiles, "Cards shown")
         t2, self.tile_view = stat_tile(tiles, "Value of this view")
         t3, self.tile_all = stat_tile(tiles, "Whole deck")
         for t in (t1, t2, t3):
             t.pack(side="left", padx=(8, 0))
+        self.tiles = (t1, t2, t3)
         hb = ttk.Frame(head)
-        hb.grid(row=0, column=2, sticky="e", padx=(16, 0))
         ttk.Button(hb, text="Settings", style="Small.TButton", command=self.open_settings,
                    takefocus=0).pack(side="left", padx=(0, 6))
         self.update_btn = ttk.Button(hb, text="Check for updates", style="Small.TButton",
@@ -4071,6 +4531,8 @@ class ScannerApp:
         self.update_btn.pack(side="left", padx=(0, 6))
         ttk.Button(hb, text="Exit", style="Danger.TButton", command=self.on_close,
                    takefocus=0).pack(side="left")
+        self.banner.set_right([(hb, 16), (tiles, 0)])
+        root.after(200, self.banner.refresh)
 
         # ---- left: camera
         left = ttk.Frame(root, padding=(22, 8, 10, 12))
@@ -4522,6 +4984,45 @@ class ScannerApp:
         elif name == "number_first":
             self.number_first = bool(value)
 
+    def set_look(self, **changes):
+        """Change appearance settings, save them and show the result straight away."""
+        self.look.update(changes)
+        self.settings["look"] = dict(self.look)
+        save_json(SETTINGS_FILE, self.settings)
+        self.apply_look()
+
+    def reset_look(self):
+        keep = self.look["text_size"]
+        self.look = dict(LOOK_DEFAULTS, text_size=keep)
+        self.settings["look"] = dict(self.look)
+        save_json(SETTINGS_FILE, self.settings)
+        self.apply_look()
+
+    def apply_look(self):
+        global ROW_HEIGHT
+        ROW_HEIGHT = ROW_HEIGHTS[self.look["rows"]]       # text size waits for the next start
+        old = apply_palette(theme_palette(self.look["theme"], self.look["accent"]))
+        try:
+            apply_theme(self.root)
+            recolor_widgets(self.root, old, C)
+            self.tree.tag_configure("odd", background=C["stripe"])
+            self.tree.tag_configure("foil", foreground=C["gold"])
+        except (tk.TclError, AttributeError):
+            pass
+        if self.banner is not None:
+            self.banner.refresh()
+
+    def flash_tiles(self):
+        """A brief gold flash on the totals when a card is added (only with animations on)."""
+        if not self.look["animations"]:
+            return
+        try:
+            for t in self.tiles:
+                t.num.configure(foreground=C["gold"])
+            self.root.after(450, lambda: [t.num.configure(foreground=C["text"]) for t in self.tiles])
+        except (tk.TclError, AttributeError):
+            pass
+
     def open_settings(self):
         if self.busy:
             return
@@ -4906,6 +5407,9 @@ class ScannerApp:
         stored = self.add_to_collection(card)
         self.save_cards()
         self.refresh_table()
+        self.flash_tiles()
+        if self.look["sound"]:
+            play_scan_sound()
         self.set_status(
             f"Added {card['qty']}x {card['name']} ({finish_text(card)}) - {money(card['price'])} each"
             + (f".  You now have {stored['qty']}." if stored is not card else "."))

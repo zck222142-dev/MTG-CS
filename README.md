@@ -1,4 +1,3 @@
-[README (4).md](https://github.com/user-attachments/files/35001309/README.4.md)
 # MTG Card Scanner
 
 A Windows desktop app that identifies Magic: The Gathering cards from a webcam or a phone
@@ -171,6 +170,18 @@ will choose a printing for those.
 
 Import rules change and differ from site to site, and this app has not been tested against
 each one. Check the preview a site shows before you confirm an import.
+
+### Making it look the way you like (Settings > Appearance)
+
+Changes show straight away and are remembered.
+
+- **Theme**: Midnight (the default), Plains, Island, Swamp, Mountain, Forest, or High contrast. These are drawn by the app, no card art is used.
+- **Accent colour**: pick any colour for buttons and highlights, or go back to the theme's own.
+- **Header artwork**: soft theme art, no art, or **your own picture** (Choose picture...). Your picture is cropped to fit and darkened so the text stays readable; use "Darken my picture" to adjust. The art lives in the header at the top of the window.
+- **Animations**: slowly drifting lights in the header and a brief flash on the totals when you add a card. One switch turns all of it off; "Calm" slows it down. It pauses while the window is minimised.
+- **List rows** (Compact / Normal / Roomy) and **Text size** (Small / Normal / Large; text size applies the next time the app starts).
+- **Sound**: an optional soft sound when a card is added (off by default).
+- **Reset appearance** puts everything back (your text size is kept).
 
 ### Settings and key binds
 Click **Settings** (or press **Ctrl+comma**).
