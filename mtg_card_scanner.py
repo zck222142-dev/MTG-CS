@@ -3075,7 +3075,9 @@ def text_width(text, size=10, bold=False):
 
 
 class CanvasButton:
-    """A rounded button drawn on the header, so it sits on the artwork instead of in a grey box."""
+    """A rounded button drawn on the header. Its shapes are made once and only recoloured or moved
+    afterwards - deleting and redrawing a shape under the mouse makes Tk fire enter/leave events
+    again and again."""
     H = 34
 
     def __init__(self, canvas, text, command, kind="normal"):
@@ -3083,6 +3085,7 @@ class CanvasButton:
         self.tag = f"btn{id(self)}"
         self.hover = False
         self.x = self.y = None
+        self.shape = self.label = None
         canvas.tag_bind(self.tag, "<Enter>", lambda e: self._hover(True))
         canvas.tag_bind(self.tag, "<Leave>", lambda e: self._hover(False))
         canvas.tag_bind(self.tag, "<Button-1>", lambda e: self.command())
@@ -3100,32 +3103,43 @@ class CanvasButton:
             self.draw(self.x, self.y)
 
     def _hover(self, on):
+        if on == self.hover:
+            return
         self.hover = on
         try:
             self.canvas.configure(cursor="hand2" if on else "")
         except Exception:  # noqa: BLE001
             pass
-        if self.x is not None:
-            self.draw(self.x, self.y)
+        self.recolor()
+
+    def _colors(self):
+        if self.kind == "accent":
+            return (C["accent_hi"] if self.hover else C["accent"]), C["accent_hi"], C["on_accent"]
+        if self.kind == "danger":
+            return (mix(C["panel"], C["bad"], 0.22 if self.hover else 0.1),
+                    mix(C["bad"], C["bg"], 0.35), C["bad"])
+        return ((C["hover"] if self.hover else C["panel"]),
+                (C["accent"] if self.hover else C["line"]), C["text"])
+
+    def recolor(self):
+        if self.shape is None:
+            return
+        fill, line, fg = self._colors()
+        self.canvas.itemconfigure(self.shape, fill=fill, outline=line)
+        self.canvas.itemconfigure(self.label, fill=fg, text=self.text, font=F(10, "bold"))
 
     def draw(self, right, cy):
-        """Draw with the right edge at x=right, centred on cy."""
+        """Place with the right edge at x=right, centred on cy (creates the shapes the first time)."""
         self.x, self.y = right, cy
-        c = self.canvas
-        c.delete(self.tag)
-        if self.kind == "accent":
-            fill = C["accent_hi"] if self.hover else C["accent"]
-            line, fg = C["accent_hi"], C["on_accent"]
-        elif self.kind == "danger":
-            fill = mix(C["panel"], C["bad"], 0.22 if self.hover else 0.1)
-            line, fg = mix(C["bad"], C["bg"], 0.35), C["bad"]
+        c, w, h = self.canvas, self.width, self.H
+        pts = round_pts(right - w, cy - h / 2, right, cy + h / 2, 12)
+        if self.shape is None:
+            self.shape = c.create_polygon(pts, smooth=True, width=1, tags=(self.tag,))
+            self.label = c.create_text(right - w / 2, cy, tags=(self.tag,))
         else:
-            fill = C["hover"] if self.hover else C["panel"]
-            line, fg = (C["accent"] if self.hover else C["line"]), C["text"]
-        w, h = self.width, self.H
-        c.create_polygon(round_pts(right - w, cy - h / 2, right, cy + h / 2, 12), smooth=True,
-                         fill=fill, outline=line, width=1, tags=(self.tag,))
-        c.create_text(right - w / 2, cy, text=self.text, fill=fg, font=F(10, "bold"), tags=(self.tag,))
+            c.coords(self.shape, *pts)
+            c.coords(self.label, right - w / 2, cy)
+        self.recolor()
 
 
 class CanvasTile:
@@ -3134,8 +3148,9 @@ class CanvasTile:
 
     def __init__(self, canvas, caption):
         self.canvas, self.caption, self.value = canvas, caption, "0"
-        self.tag = f"tile{id(self)}"
         self.x = self.y = None
+        self.shape = self.num = self.cap = None
+        self.flashing = False
 
     @property
     def width(self):
@@ -3146,21 +3161,27 @@ class CanvasTile:
         if self.x is not None:
             self.draw(self.x, self.y)
 
-    def draw(self, right, cy, flash=False):
+    def draw(self, right, cy):
         self.x, self.y = right, cy
-        c = self.canvas
-        c.delete(self.tag)
-        w, h = self.width, self.H
-        c.create_polygon(round_pts(right - w, cy - h / 2, right, cy + h / 2, 14), smooth=True,
-                         fill=C["panel"], outline=C["line"], tags=(self.tag,))
-        c.create_text(right - w + 18, cy - 10, anchor="w", text=self.value,
-                      fill=C["gold"] if flash else C["text"], font=F(17, "bold"), tags=(self.tag,))
-        c.create_text(right - w + 18, cy + 15, anchor="w", text=self.caption, fill=C["muted"],
-                      font=F(9), tags=(self.tag,))
+        c, w, h = self.canvas, self.width, self.H
+        pts = round_pts(right - w, cy - h / 2, right, cy + h / 2, 14)
+        if self.shape is None:
+            self.shape = c.create_polygon(pts, smooth=True)
+            self.num = c.create_text(0, 0, anchor="w")
+            self.cap = c.create_text(0, 0, anchor="w")
+        else:
+            c.coords(self.shape, *pts)
+        c.coords(self.num, right - w + 18, cy - 10)
+        c.coords(self.cap, right - w + 18, cy + 15)
+        c.itemconfigure(self.shape, fill=C["panel"], outline=C["line"])
+        c.itemconfigure(self.num, text=self.value, font=F(17, "bold"),
+                        fill=C["gold"] if self.flashing else C["text"])
+        c.itemconfigure(self.cap, text=self.caption, fill=C["muted"], font=F(9))
 
-    def flash(self):
+    def flash(self, on=True):
+        self.flashing = on
         if self.x is not None:
-            self.draw(self.x, self.y, flash=True)
+            self.draw(self.x, self.y)
 
 
 class Banner:
@@ -3267,7 +3288,9 @@ class Banner:
             return
         self.parts = make_particles(w, self.HEIGHT, 34, seed=sum(ord(c) for c in look["theme"]))
         for _ in self.parts:
-            self.dots.append(self.canvas.create_oval(0, 0, 1, 1, outline="", fill=C["bg"]))
+            self.dots.append(self.canvas.create_oval(0, 0, 1, 1, outline="", fill=C["bg"], tags=("dot",)))
+        self.canvas.tag_lower("dot")                       # lights drift behind the buttons
+        self.canvas.tag_lower(self.bg_item)
         self._draw_particles()
         if not self.running:
             self.running = True
@@ -5119,7 +5142,7 @@ class ScannerApp:
         try:
             for t in self.tiles:
                 t.flash()
-            self.root.after(450, self.banner.layout)
+            self.root.after(450, lambda: [t.flash(False) for t in self.tiles])
         except (tk.TclError, AttributeError):
             pass
 
