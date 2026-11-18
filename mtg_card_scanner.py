@@ -469,14 +469,14 @@ def banner_image(w, h, palette, theme="Midnight", custom=None, dim=0.45):
     else:
         panel2 = np.array(_rgb(palette["panel2"]), float)
         t = (yy / max(1, h - 1))[..., None]
-        img = bg * (1 - t) + panel2 * t * 0.7
+        img = bg * (1 - t * 0.6) + panel2 * t * 0.45
         rnd = np.random.default_rng(sum(ord(c) for c in theme))
         cols = [np.array(_rgb(palette["accent"]), float), np.array(_rgb(palette["accent_hi"]), float)]
         for i in range(5):
             cx, cy = rnd.uniform(0.3, 1.0) * w, rnd.uniform(0.05, 0.95) * h
             r = rnd.uniform(0.07, 0.2) * w
             g = np.exp(-(((xx - cx) ** 2) / (2 * r * r) + ((yy - cy) ** 2) / (2 * (0.5 * r) ** 2)))[..., None]
-            k = rnd.uniform(0.25, 0.5) * (0.55 if theme == "High contrast" else 1.0)
+            k = rnd.uniform(0.12, 0.3) * (0.55 if theme == "High contrast" else 1.0)
             img = img * (1 - g * k) + cols[i % 2] * g * k
     left = np.clip(0.6 + 0.4 * (xx / (0.45 * w)), 0.6, 1.0)[..., None]          # keeps the title readable
     edge = np.clip(1.0 - 0.35 * (np.abs(xx / w - 0.5) * 2) ** 3, 0.65, 1.0)[..., None]
@@ -3063,6 +3063,105 @@ def stat_tile(parent, caption):
     return f, var
 
 
+def round_pts(x1, y1, x2, y2, r):
+    """Corner points for a smooth rounded rectangle on a canvas."""
+    return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2,
+            x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+
+def text_width(text, size=10, bold=False):
+    return int(len(text) * size * FONT_SCALE * (0.78 if bold else 0.66)) + 2
+
+
+class CanvasButton:
+    """A rounded button drawn on the header, so it sits on the artwork instead of in a grey box."""
+    H = 34
+
+    def __init__(self, canvas, text, command, kind="normal"):
+        self.canvas, self.command, self.kind, self.text = canvas, command, kind, text
+        self.tag = f"btn{id(self)}"
+        self.hover = False
+        self.x = self.y = None
+        canvas.tag_bind(self.tag, "<Enter>", lambda e: self._hover(True))
+        canvas.tag_bind(self.tag, "<Leave>", lambda e: self._hover(False))
+        canvas.tag_bind(self.tag, "<Button-1>", lambda e: self.command())
+
+    @property
+    def width(self):
+        return text_width(self.text, 10, True) + 36
+
+    def configure(self, text=None, style=None, **_):
+        if text is not None:
+            self.text = text
+        if style is not None:
+            self.kind = "accent" if style.startswith("Accent") else "normal"
+        if self.x is not None:
+            self.draw(self.x, self.y)
+
+    def _hover(self, on):
+        self.hover = on
+        try:
+            self.canvas.configure(cursor="hand2" if on else "")
+        except Exception:  # noqa: BLE001
+            pass
+        if self.x is not None:
+            self.draw(self.x, self.y)
+
+    def draw(self, right, cy):
+        """Draw with the right edge at x=right, centred on cy."""
+        self.x, self.y = right, cy
+        c = self.canvas
+        c.delete(self.tag)
+        if self.kind == "accent":
+            fill = C["accent_hi"] if self.hover else C["accent"]
+            line, fg = C["accent_hi"], C["on_accent"]
+        elif self.kind == "danger":
+            fill = mix(C["panel"], C["bad"], 0.22 if self.hover else 0.1)
+            line, fg = mix(C["bad"], C["bg"], 0.35), C["bad"]
+        else:
+            fill = C["hover"] if self.hover else C["panel"]
+            line, fg = (C["accent"] if self.hover else C["line"]), C["text"]
+        w, h = self.width, self.H
+        c.create_polygon(round_pts(right - w, cy - h / 2, right, cy + h / 2, 12), smooth=True,
+                         fill=fill, outline=line, width=1, tags=(self.tag,))
+        c.create_text(right - w / 2, cy, text=self.text, fill=fg, font=F(10, "bold"), tags=(self.tag,))
+
+
+class CanvasTile:
+    """A total (number over a caption) on a rounded card; set() changes the number."""
+    H = 62
+
+    def __init__(self, canvas, caption):
+        self.canvas, self.caption, self.value = canvas, caption, "0"
+        self.tag = f"tile{id(self)}"
+        self.x = self.y = None
+
+    @property
+    def width(self):
+        return max(112, max(text_width(self.value, 17, True), text_width(self.caption, 9)) + 36)
+
+    def set(self, value):
+        self.value = str(value)
+        if self.x is not None:
+            self.draw(self.x, self.y)
+
+    def draw(self, right, cy, flash=False):
+        self.x, self.y = right, cy
+        c = self.canvas
+        c.delete(self.tag)
+        w, h = self.width, self.H
+        c.create_polygon(round_pts(right - w, cy - h / 2, right, cy + h / 2, 14), smooth=True,
+                         fill=C["panel"], outline=C["line"], tags=(self.tag,))
+        c.create_text(right - w + 18, cy - 10, anchor="w", text=self.value,
+                      fill=C["gold"] if flash else C["text"], font=F(17, "bold"), tags=(self.tag,))
+        c.create_text(right - w + 18, cy + 15, anchor="w", text=self.caption, fill=C["muted"],
+                      font=F(9), tags=(self.tag,))
+
+    def flash(self):
+        if self.x is not None:
+            self.draw(self.x, self.y, flash=True)
+
+
 class Banner:
     """The header: artwork behind the title, the totals and the buttons, with optional slow motion."""
     HEIGHT = 112
@@ -3089,21 +3188,16 @@ class Banner:
         self.canvas.bind("<Configure>", self._on_resize)
 
     def set_right(self, items):
-        """items: [(widget, gap after)] placed right to left along the right edge."""
-        for wd, gap in items:
-            wid = self.canvas.create_window(0, self.HEIGHT // 2, window=wd, anchor="e")
-            self.items.append((wd, gap, wid))
+        """items: [(part, gap after it)] listed left to right; drawn from the right edge."""
+        self.items = list(items)
         self.layout()
 
     def layout(self):
         w = self.w or self.canvas.winfo_width()
-        x = w - 22
-        for wd, gap, wid in reversed(self.items):
-            self.canvas.coords(wid, x, self.HEIGHT // 2)
-            try:
-                x -= wd.winfo_reqwidth() + gap
-            except Exception:  # noqa: BLE001
-                x -= 100
+        x = w - 24
+        for part, gap in reversed(self.items):
+            part.draw(x, self.HEIGHT // 2)
+            x -= part.width + gap
 
     def _on_resize(self, e):
         if self._resize_job:
@@ -3133,6 +3227,7 @@ class Banner:
         self.canvas.configure(bg=C["bg"])
         self.canvas.itemconfigure(self.title_item, fill=C["text"], font=F(19, "bold"))
         self.canvas.itemconfigure(self.sub_item, fill=C["muted"], font=F(10))
+        self.layout()
         if w > 20:
             art = look["art"]
             if art == "none":
@@ -4516,22 +4611,15 @@ class ScannerApp:
         self.banner = Banner(root, self)
         self.banner.canvas.grid(row=0, column=0, columnspan=2, sticky="ew")
         head = self.banner.canvas
-        tiles = ttk.Frame(head)
-        t1, self.tile_count = stat_tile(tiles, "Cards shown")
-        t2, self.tile_view = stat_tile(tiles, "Value of this view")
-        t3, self.tile_all = stat_tile(tiles, "Whole deck")
-        for t in (t1, t2, t3):
-            t.pack(side="left", padx=(8, 0))
-        self.tiles = (t1, t2, t3)
-        hb = ttk.Frame(head)
-        ttk.Button(hb, text="Settings", style="Small.TButton", command=self.open_settings,
-                   takefocus=0).pack(side="left", padx=(0, 6))
-        self.update_btn = ttk.Button(hb, text="Check for updates", style="Small.TButton",
-                                     command=self.on_update_click, takefocus=0)
-        self.update_btn.pack(side="left", padx=(0, 6))
-        ttk.Button(hb, text="Exit", style="Danger.TButton", command=self.on_close,
-                   takefocus=0).pack(side="left")
-        self.banner.set_right([(hb, 16), (tiles, 0)])
+        self.tile_count = CanvasTile(head, "Cards shown")
+        self.tile_view = CanvasTile(head, "Value of this view")
+        self.tile_all = CanvasTile(head, "Whole deck")
+        self.tiles = (self.tile_count, self.tile_view, self.tile_all)
+        b_set = CanvasButton(head, "Settings", self.open_settings)
+        self.update_btn = CanvasButton(head, "Check for updates", self.on_update_click)
+        b_exit = CanvasButton(head, "Exit", self.on_close, "danger")
+        self.banner.set_right([(self.tile_count, 10), (self.tile_view, 10), (self.tile_all, 22),
+                               (b_set, 8), (self.update_btn, 8), (b_exit, 0)])
         root.after(200, self.banner.refresh)
 
         # ---- left: camera
@@ -5018,8 +5106,8 @@ class ScannerApp:
             return
         try:
             for t in self.tiles:
-                t.num.configure(foreground=C["gold"])
-            self.root.after(450, lambda: [t.num.configure(foreground=C["text"]) for t in self.tiles])
+                t.flash()
+            self.root.after(450, self.banner.layout)
         except (tk.TclError, AttributeError):
             pass
 
