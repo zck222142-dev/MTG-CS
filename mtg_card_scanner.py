@@ -48,6 +48,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unicodedata
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -3205,9 +3206,12 @@ class Banner:
                 self.root.after_cancel(self._resize_job)
             except Exception:  # noqa: BLE001
                 pass
-        self.w = int(getattr(e, "width", 0) or 0)
-        self.layout()
-        self._resize_job = self.root.after(90, self.refresh)
+        try:
+            self.w = int(getattr(e, "width", 0) or 0)
+            self.layout()
+            self._resize_job = self.root.after(150, self.refresh)
+        except Exception:  # noqa: BLE001 - a header problem must never close the app
+            log_error("header resize")
 
     def _custom_image(self, path):
         if not path:
@@ -3222,8 +3226,16 @@ class Banner:
 
     def refresh(self):
         """Redraw the artwork and colours (after a resize or a settings change)."""
+        try:
+            self._refresh()
+        except Exception:  # noqa: BLE001
+            log_error("header art")
+            self.running = False
+            self.canvas.itemconfigure(self.bg_item, image="")
+
+    def _refresh(self):
         look = self.app.look
-        w = int(self.w or self.canvas.winfo_width() or 0)
+        w = min(3000, int(self.w or self.canvas.winfo_width() or 0))
         self.canvas.configure(bg=C["bg"])
         self.canvas.itemconfigure(self.title_item, fill=C["text"], font=F(19, "bold"))
         self.canvas.itemconfigure(self.sub_item, fill=C["muted"], font=F(10))
@@ -5867,10 +5879,27 @@ class ScannerApp:
         self.root.destroy()
 
 
+def log_error(where, exc_info=None):
+    """Write a problem to 'error log.txt' in the data folder (never raises)."""
+    try:
+        ensure_dirs()
+        text = "".join(traceback.format_exception(*(exc_info or sys.exc_info())))
+        with open(DATA_DIR / "error log.txt", "a", encoding="utf-8") as f:
+            f.write(f"--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S}  {APP_VERSION}  {where}\n{text}\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main():
     root = tk.Tk()
-    ScannerApp(root)
-    root.mainloop()
+    root.report_callback_exception = lambda *exc: log_error("screen", exc)
+    sys.excepthook = lambda *exc: log_error("program", exc)
+    try:
+        ScannerApp(root)
+        root.mainloop()
+    except Exception:  # noqa: BLE001
+        log_error("main")
+        raise
 
 
 if __name__ == "__main__":
