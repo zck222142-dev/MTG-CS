@@ -428,6 +428,17 @@ def _card_colors(c):
     return cols
 
 
+def _art_urls(c):
+    """Artwork of every face (a double-faced card may be photographed on either side)."""
+    urls = []
+    faces = [c] + list(c.get("card_faces") or [])
+    for f in faces:
+        u = ((f or {}).get("image_uris") or {}).get("art_crop", "")
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+
 def _art_url(c):
     uris = c.get("image_uris") or {}
     if not uris and c.get("card_faces"):
@@ -452,6 +463,7 @@ def _parse_scryfall(c):
         "type_line": c.get("type_line", ""),
         "colors": _card_colors(c),
         "art_url": _art_url(c),
+        "art_urls": _art_urls(c),
         "price_nonfoil": _money(p.get("usd")),
         "price_foil": _money(p.get("usd_foil") or p.get("usd_etched")),
         "set_code": str(c.get("set", "")).lower(),
@@ -616,10 +628,18 @@ def cards_by_names(names):
     names = list(dict.fromkeys(n for n in names if n))[:75]
     if not names:
         return {}
-    r = scryfall("POST", "/cards/collection", json={"identifiers": [{"name": n} for n in names]})
+    fronts = list(dict.fromkeys(n.split(" // ")[0] for n in names))     # a double-faced card is found by its front face
+    r = scryfall("POST", "/cards/collection", json={"identifiers": [{"name": n} for n in fronts]})
     if r.status_code != 200:
         return {}
-    return {c["name"]: c for c in r.json().get("data", [])}
+    out = {}
+    for c in r.json().get("data", []):
+        out[c["name"]] = c
+        out.setdefault(c["name"].split(" // ")[0], c)
+    for n in names:                       # callers ask by the full name
+        if n not in out and n.split(" // ")[0] in out:
+            out[n] = out[n.split(" // ")[0]]
+    return out
 
 
 def card_by_set_number(set_code, number):
@@ -1530,6 +1550,10 @@ def parse_collector(texts, sets):
             continue
         fixed = head.translate(str.maketrans("OIL", "011"))
         digits = sum(c.isdigit() for c in head)
+        glued = re.fullmatch(r"[CURMLST]?(\d{3,4})[CURMLST]?", head)     # "U0021": rarity letter stuck to the number
+        if glued:
+            numbers.append(glued.group(1).lstrip("0") or "0")
+            continue
         if re.fullmatch(r"\d{1,4}", fixed) and digits >= len(head) - 1:
             numbers.append(fixed.lstrip("0") or "0")
             continue
@@ -1874,13 +1898,19 @@ def _recognize_standard(cards, catalog, online, emit, sets, read_number, reads=N
                 rec = recs.get(c["name"])
                 if not rec:
                     return
-                url = _art_url(rec)
-                blob = fetch_bytes(url)
-                img = decode_image(blob)
-                if img is None:
+                best_score, best_blob = None, None
+                for url in _art_urls(rec) or [_art_url(rec)]:
+                    blob = fetch_bytes(url)
+                    img = decode_image(blob)
+                    if img is None:
+                        continue
+                    sc = art_similarity(photo_art, img)
+                    if best_score is None or sc > best_score:
+                        best_score, best_blob = sc, blob
+                if best_score is None:
                     return
-                c["art_bytes"] = blob
-                c["art_score"] = art_similarity(photo_art, img)
+                c["art_bytes"] = best_blob
+                c["art_score"] = best_score
             except Exception:
                 return
 
@@ -2165,7 +2195,8 @@ def save_debug(debug_dir, cards, reads, cands, res=None):
 def rank_printings_by_art(photo_art, matches, limit=12):
     """Compare the photographed artwork with each printing's artwork.
     Returns {index: score} for the printings that could be compared."""
-    todo = [(i, m["art_url"]) for i, m in enumerate(matches[:limit]) if m.get("art_url")]
+    todo = [(i, url) for i, m in enumerate(matches[:limit])
+            for url in (m.get("art_urls") or ([m["art_url"]] if m.get("art_url") else []))]
     if not todo:
         return {}
 
@@ -2174,8 +2205,12 @@ def rank_printings_by_art(photo_art, matches, limit=12):
         img = fetch_small(url)
         return i, (art_similarity(photo_art, img) if img is not None else None)
 
+    best = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
-        return {i: sc for i, sc in ex.map(score, todo) if sc is not None}
+        for i, sc in ex.map(score, todo):
+            if sc is not None and sc > best.get(i, -1.0):
+                best[i] = sc            # either face of a double-faced card may match
+    return best
 
 
 # ------------------------------------------------------- filtering/sorting
@@ -5141,8 +5176,9 @@ class ScannerApp:
                 self.root.after(400, self.process_phone)
 
     def handle_phone_photo(self, link, job, img, live=False):
-        # live frames are framed by the phone's card-shaped guide; photos are the whole picture
-        if self.mode_var.get() == "batch" and not live and self.scan_action.get() == "add":
+        # live frames are framed by the phone's card-shaped guide; photos are the whole picture.
+        # Batch mode wants the whole picture either way (the phone sends the full frame).
+        if self.mode_var.get() == "batch" and self.scan_action.get() == "add":
             n = self.run_batch(img)
             link.set_status(job, "added" if n else "skipped", f"{n} cards" if n else "")
             return
