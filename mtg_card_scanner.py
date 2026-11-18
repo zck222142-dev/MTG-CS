@@ -121,7 +121,7 @@ BOX_HEIGHT_FRACTION = 0.92           # size of the guide frame
 # Version. The installer build (GitHub Actions) writes build_info.txt next to the app with
 # the full version (for example 1.3.27) and the name of your GitHub repository, so the
 # app knows what it is and where to look for updates. Running from source: version x.y.0.
-APP_BASE_VERSION = "1.4"
+APP_BASE_VERSION = "1.5"
 
 
 def app_dir():
@@ -792,6 +792,9 @@ ACTIONS = [
     ("auto", "Switch Manual / Auto capture", "a"),
     ("finish", "Switch new scans Non-foil / Foil", "t"),
     ("card_mode", "Switch card type Standard / Land / Token", "m"),
+    ("scan_action", "Switch scan action Add / Find / Commander", "s"),
+    ("batch_mode", "Switch Batch mode on / off", "b"),
+    ("commander", "Make the selected card a commander (or remove it)", "c"),
     ("phone", "Open the phone link", "p"),
     ("photo", "Add from a photo file", "o"),
     ("add_name", "Add by name or number", "n"),
@@ -1164,6 +1167,104 @@ def detect_card(frame):
     if best is None:
         return None
     return portrait_quad(best / scale)
+
+
+def refine_quad(frame, quad):
+    """Tighten a rough outline: run the single-card finder on a small crop around it."""
+    h, w = frame.shape[:2]
+    x, y, bw, bh = cv2.boundingRect(np.asarray(quad, dtype="int32"))
+    pad = int(0.12 * max(bw, bh))
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+    if x1 - x0 < 40 or y1 - y0 < 40:
+        return quad
+    q = detect_card(frame[y0:y1, x0:x1])
+    if q is None:
+        return quad
+    q = q + np.array([x0, y0], dtype="float32")
+    old_a, new_a = cv2.contourArea(np.asarray(quad, dtype="float32")), cv2.contourArea(q.astype("float32"))
+    if old_a <= 0 or not 0.75 <= new_a / old_a <= 1.3:
+        return quad
+    if np.linalg.norm(q.mean(axis=0) - np.asarray(quad).mean(axis=0)) > 0.12 * max(bw, bh):
+        return quad
+    return q
+
+
+def find_cards(frame, max_cards=24):
+    """Batch mode: find every card lying on a table in one picture.
+    Returns a list of 4-corner outlines in reading order (rows top to bottom, left to right).
+    Cards should be spread out so they don't touch, on a plain table. Card borders are black,
+    so a light table works best and a black one worst."""
+    h, w = frame.shape[:2]
+    scale = 1280.0 / max(h, w) if max(h, w) > 1280 else 1.0
+    small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1.0 else frame
+    g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(g)
+    g = cv2.GaussianBlur(g, (5, 5), 0)
+    sh, sw = g.shape
+    best = []          # outlines from every setting below; duplicates are dropped afterwards
+
+    def consider(c, prio):
+        area = cv2.contourArea(c)
+        if area < 0.004 * sw * sh or area > 0.6 * sw * sh:
+            return
+        hull = cv2.convexHull(c)
+        approx = cv2.approxPolyDP(hull, 0.03 * cv2.arcLength(hull, True), True)
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2)
+        else:
+            rect = cv2.minAreaRect(hull)
+            rect_area = rect[1][0] * rect[1][1]
+            if rect_area <= 0 or cv2.contourArea(hull) / rect_area < 0.86:
+                return
+            pts = cv2.boxPoints(rect)
+        q = order_quad(pts)
+        wd = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
+        ht = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
+        if wd <= 0 or ht <= 0 or abs(min(wd, ht) / max(wd, ht) - CARD_RATIO) > 0.14:
+            return
+        best.append((prio, cv2.contourArea(q.astype("float32")), q))
+
+    for lo, hi, close in ((30, 90, 5), (10, 45, 5), (20, 60, 11)):
+        edges = cv2.Canny(g, lo, hi)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((close, close), np.uint8))
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            consider(c, 0)
+    # plain light / dark separation: cards against an evenly coloured table
+    _, otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for mask in (otsu, 255 - otsu):
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            consider(c, 1)      # used only where the edge search found nothing
+    if not best:
+        return []
+    med = float(np.median([a for _, a, _ in best]))
+    best = [t for t in best if 0.55 * med <= t[1] <= 1.8 * med]   # cards are all the same size
+    best.sort(key=lambda t: (t[0], -t[1]))
+    kept = []
+    for _p, _a, q in best:      # drop outlines sitting inside one we already have
+        cx, cy = q.mean(axis=0)
+        if any(cv2.pointPolygonTest(k.astype("float32"), (float(cx), float(cy)), False) >= 0 for k in kept):
+            continue
+        kept.append(q)
+    kept = kept[:max_cards]
+    if not kept:
+        return []
+    row_h = float(np.median([np.linalg.norm(q[3] - q[0]) for q in kept]))
+    kept.sort(key=lambda q: q.mean(axis=0)[1])
+    rows, cur = [], [kept[0]]
+    for q in kept[1:]:
+        if abs(q.mean(axis=0)[1] - np.mean([x.mean(axis=0)[1] for x in cur])) <= 0.5 * row_h:
+            cur.append(q)
+        else:
+            rows.append(cur)
+            cur = [q]
+    rows.append(cur)
+    ordered = [q for r in rows for q in sorted(r, key=lambda x: x.mean(axis=0)[0])]
+    return [refine_quad(frame, portrait_quad(q / scale)) for q in ordered]
 
 
 def warp_card(frame, quad):
@@ -1660,10 +1761,80 @@ def read_name_reads(prepared, catalog, treatments=4):
     return reads
 
 
-def _recognize_standard(cards, catalog, online, emit, sets, read_number, reads=None, prepared=None):
+NUMBER_SHARP_MIN = 35.0     # how sharp the small print must be before it is read first (a guess, not yet tuned)
+BATCH_MIN_CONF = 0.55       # batch mode: below this a card is "couldn't tell" and goes to the back
+
+
+def small_print_sharpness(card):
+    """How sharp the bottom-left corner is (bigger = sharper)."""
+    if card is None:
+        return 0.0
+    crop = _prep_strip(card, COLLECTOR_BOX, 1.0)
+    return sharpness_score(crop)
+
+
+def _fast_number_path(cards, prepared, catalog, emit, sets):
+    """When the picture is sharp, read the set code and number FIRST. A real set + number
+    names the exact printing in one quick lookup, so the slow steps (several OCR passes,
+    name search, artwork comparison of many guesses) can be skipped. The title is still
+    read once and must agree, so a misread number never goes through on its own.
+    Returns a result like _recognize_standard's, or None to use the normal order."""
+    sharp = small_print_sharpness(cards[0])
+    if sharp < NUMBER_SHARP_MIN:
+        return None
+    guesses, raw = read_collector(cards[0], sets)
+    rec = None
+    try:
+        for code, num in guesses[:2]:
+            if num:
+                rec = card_by_set_number(code, num)
+                if rec:
+                    break
+    except Exception:
+        return None
+    if not rec:
+        return None
+    front = rec["name"].split(" // ")[0]
+    reads = []
+    for text, conf in ocr_read_iter(prepared[0], treatments=1):
+        reads.append((text, conf))
+        break
+    if not reads:
+        return None
+    sim = similarity(norm(reads[0][0]), norm(front))
+    if sim < 0.75:
+        return None
+    photo_art = art_region(prepared[0])
+    art, blob = None, None
+    try:
+        blob = art_blob(rec.get("art_url", ""))
+        img = decode_image(blob) if blob else None
+        if img is not None:
+            art = art_similarity(photo_art, img)
+    except Exception:
+        pass
+    final = min(1.0, 0.65 * sim + 0.35 * (art if art is not None else sim) + NUMBER_BONUS)
+    cands = [{"name": rec["name"], "name_score": sim, "art_score": art, "final": final,
+              "art_bytes": blob, "number_hit": True}]
+    for nm, sc in (catalog.rank(reads, limit=4) if catalog.ready else []):
+        if norm(nm) != norm(rec["name"]) and len(cands) < 4:
+            cands.append({"name": nm, "name_score": sc, "art_score": None, "final": sc, "art_bytes": None})
+    emit("number", {"cands": [dict(c) for c in cands], "reads": list(reads), "mode": "standard",
+                    "hit": rec, "confirmed": True})
+    return {"reads": reads, "cands": cands, "notes": [], "matches": None, "mode": "standard",
+            "hit": rec, "confirmed": True, "number_reads": raw, "fast": True, "number_sharp": sharp}
+
+
+def _recognize_standard(cards, catalog, online, emit, sets, read_number, reads=None, prepared=None,
+                        number_first=False):
     """A normal card: name, then artwork, then (last, because the print is tiny) the set
     code and number, which only nudge the order and pick the printing."""
     prepared = prepared if prepared is not None else [enhance(c) for c in cards]
+    if (number_first and reads is None and read_number and online and cards
+            and sets is not None and sets.ready and catalog.ready):
+        fast = _fast_number_path(cards, prepared, catalog, emit, sets)
+        if fast is not None:
+            return fast
     if reads is None:
         reads = read_name_reads(prepared, catalog)
 
@@ -1930,7 +2101,7 @@ def _recognize_token(cards, catalog, online, emit, sets, types, read_number):
 
 
 def recognize(cards, catalog, debug_dir=None, online=True, emit=None, mode="standard",
-              sets=None, types=None, read_number=True):
+              sets=None, types=None, read_number=True, number_first=False):
     """Work out which card this is. cards: straightened pictures, sharpest first.
     mode: "standard", "land" (basic lands) or "token".
     emit(kind, value) is called as results arrive so the screen can update early:
@@ -1948,7 +2119,8 @@ def recognize(cards, catalog, debug_dir=None, online=True, emit=None, mode="stan
     elif mode == "token" and cards:
         res = _recognize_token(cards, catalog, online, emit, sets, types, read_number)
     if res is None:
-        res = _recognize_standard(cards, catalog, online, emit, sets, read_number, **pre)
+        res = _recognize_standard(cards, catalog, online, emit, sets, read_number,
+                                  number_first=number_first, **pre)
         if mode == "land" and cards:
             res["note"] = "That doesn't look like a basic land, so it was matched like a normal card."
             emit("names", {"cands": [dict(c) for c in res["cands"]], "reads": res["reads"],
@@ -1968,7 +2140,10 @@ def save_debug(debug_dir, cards, reads, cands, res=None):
         write_image(d / f"card{i}.jpg", c)
     def pct(v):
         return "-" if v is None else f"{v:.2f}"
-    lines = [f"Mode used: {(res or {}).get('mode', 'standard')}", "", "Reads (text, confidence):"]
+    lines = [f"Mode used: {(res or {}).get('mode', 'standard')}"]
+    if res and res.get("fast"):
+        lines.append(f"Fast path: set code and number read first (small-print sharpness {res.get('number_sharp', 0):.0f})")
+    lines += ["", "Reads (text, confidence):"]
     lines += [f"  {t!r}  {c:.2f}" for t, c in reads]
     lines += ["", "Guesses:"] + [
         f"  {c['name']}  name={pct(c.get('name_score'))}  art={pct(c.get('art_score'))}  "
@@ -2075,6 +2250,35 @@ def write_export(path, rows, header_lines):
                     f"{finish_text(c):<8} {each:>9} {tot:>10}\n")
         f.write("-" * line_w + "\n")
         f.write(f"{count} cards ({len(rows)} different), total value {money(total)}\n")
+
+
+# ---------------------------------------------- finding a card across decks
+def front_key(name):
+    return norm(str(name).split(" // ")[0])
+
+
+def locate_card(name, decks):
+    """decks = {deck name: [cards]} -> [(deck name, card)] for every card with this name."""
+    key = front_key(name)
+    return [(d, c) for d, cs in decks.items() for c in cs if front_key(c["name"]) == key]
+
+
+def commander_decks(commanders, name):
+    """commanders = {deck name: [card names]} -> deck names that have this card as commander."""
+    key = front_key(name)
+    return [d for d, names in commanders.items() if any(front_key(n) == key for n in names)]
+
+
+def clean_commanders(raw, decks):
+    """Whatever is in settings -> {deck: [names]} only for decks that exist, at most two each."""
+    out = {}
+    if isinstance(raw, dict):
+        for d, names in raw.items():
+            if d in decks and isinstance(names, list):
+                good = [str(n) for n in names if isinstance(n, str) and n][:2]
+                if good:
+                    out[d] = good
+    return out
 
 
 # ---------------------------------------------- export for other websites
@@ -2621,6 +2825,123 @@ def center_on(win, parent):
 
 
 # ------------------------------------------------------------ add-card popup
+def batch_confident(res):
+    """Did the reader find a card it is reasonably sure about?"""
+    return bool(res and res.get("cands") and (res["cands"][0].get("final") or 0) >= BATCH_MIN_CONF)
+
+
+ASIDE = "__set_aside__"           # returned when a card is put at the back of the batch line
+SCAN_ACTIONS = [("add", "Add to deck"), ("find", "Find a card"), ("commander", "Commander's deck")]
+PURPOSE_TEXT = {"add": ("Add a card", "Add card"),
+                "find": ("Find a card in your decks", "Look it up"),
+                "commander": ("Go to a commander's deck", "Go to deck")}
+
+
+class DeckResultsWindow(tk.Toplevel):
+    """A short list of decks (where a card is, or which decks it commands) with a Go button.
+    rows: [(deck, card id, qty, finish, set, number, price)]"""
+
+    def __init__(self, parent, title, info, rows, on_go):
+        super().__init__(parent)
+        self.configure(bg=C["bg"])
+        self.title(title)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.rows, self.on_go = rows, on_go
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        for i, line in enumerate(info):
+            ttk.Label(body, text=line, style="Section.TLabel" if i == 0 else "Muted.TLabel",
+                      wraplength=520, justify="left").pack(anchor="w", pady=(0, 2))
+        cols = ("deck", "qty", "finish", "set", "no", "price")
+        self.tree = ttk.Treeview(body, columns=cols, show="headings", height=min(8, max(2, len(rows))))
+        for c, text, wd in (("deck", "Deck", 200), ("qty", "Qty", 40), ("finish", "Finish", 70),
+                            ("set", "Set", 170), ("no", "No.", 50), ("price", "Each", 70)):
+            self.tree.heading(c, text=text)
+            self.tree.column(c, width=wd, anchor="w")
+        self.tree.pack(fill="x", pady=(10, 10))
+        for i, r in enumerate(rows):
+            self.tree.insert("", "end", iid=str(i), values=(r[0], r[2], r[3], r[4], r[5], r[6]))
+        if rows:
+            self.tree.selection_set("0")
+        row = ttk.Frame(body)
+        row.pack(fill="x")
+        ttk.Button(row, text="Go to deck", style="Accent.TButton", command=self.go).pack(side="right")
+        ttk.Button(row, text="Close", command=self.destroy).pack(side="right", padx=(0, 8))
+        self.tree.bind("<Double-1>", lambda e: self.go())
+        self.bind("<Return>", lambda e: self.go())
+        self.bind("<Escape>", lambda e: self.destroy())
+        center_on(self, parent)
+
+    def go(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        deck, card_id = self.rows[int(sel[0])][:2]
+        self.destroy()
+        self.on_go(deck, card_id)
+
+
+class BatchWindow(tk.Toplevel):
+    """Progress while every card in a batch photo is being read in the background."""
+
+    def __init__(self, parent, total, worker):
+        super().__init__(parent)
+        self.configure(bg=C["bg"])
+        self.title("Batch scan")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.stop)
+        self.total = total
+        self.cancelled = False
+        self.q = queue.Queue()
+        self.msg = tk.StringVar(value=f"Found {total} cards. Reading them...")
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Reading the cards on the table", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(body, textvariable=self.msg, style="Muted.TLabel").pack(anchor="w", pady=(6, 8))
+        self.bar = ttk.Progressbar(body, maximum=max(1, total), length=380)
+        self.bar.pack(fill="x")
+        ttk.Label(body, text="Then you confirm each card one by one. Cards it can't tell go to the "
+                  "back of the line.", style="Muted.TLabel", wraplength=380,
+                  justify="left").pack(anchor="w", pady=(8, 10))
+        ttk.Button(body, text="Stop reading", command=self.stop).pack(anchor="e")
+        center_on(self, parent)
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        threading.Thread(target=self._run, args=(worker,), daemon=True).start()
+        self.after(100, self._poll)
+
+    def stop(self):
+        self.cancelled = True
+        self.msg.set("Stopping after this card...")
+
+    def _run(self, worker):
+        try:
+            worker(lambda i, text: self.q.put(("p", i, text)), lambda: self.cancelled)
+        except Exception as e:  # noqa: BLE001 - shown, not hidden
+            self.q.put(("p", 0, f"Problem: {e}"))
+        self.q.put(("d", 0, ""))
+
+    def _poll(self):
+        try:
+            while True:
+                kind, i, text = self.q.get_nowait()
+                if kind == "d":
+                    self.destroy()
+                    return
+                self.bar["value"] = i
+                self.msg.set(text)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        self.after(100, self._poll)
+
+
 class SiteExportDialog(tk.Toplevel):
     """Pick what to export for other websites. result = (format, scope) or None."""
 
@@ -2714,10 +3035,14 @@ class AddCardDialog(tk.Toplevel):
     lets you pick the printing, finish and quantity - or find it by set + number."""
 
     def __init__(self, parent, cards, catalog, finish, debug_dir=None, mode="standard",
-                 sets=None, types=None, read_number=True):
+                 sets=None, types=None, read_number=True, number_first=False, purpose="add",
+                 replay=None, position="", allow_aside=False):
         super().__init__(parent)
         self.configure(bg=C["bg"])
-        self.title("Add a card")
+        self.purpose = purpose if purpose in PURPOSE_TEXT else "add"
+        self.number_first = number_first
+        self.aside = False
+        self.title(PURPOSE_TEXT[self.purpose][0] + (f"   -   {position}" if position else ""))
         self.transient(parent)
         self.resizable(False, False)
         self.result = None
@@ -2826,9 +3151,13 @@ class AddCardDialog(tk.Toplevel):
 
         btns = ttk.Frame(right)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Add card", style="Accent.TButton",
+        ttk.Button(btns, text=PURPOSE_TEXT[self.purpose][1], style="Accent.TButton",
                    command=self.add).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 8))
+        ttk.Button(btns, text="Cancel" if not allow_aside else "Skip", command=self.destroy).pack(
+            side="right", padx=(0, 8))
+        if allow_aside:
+            ttk.Button(btns, text="Set aside (do it last)", command=self._set_aside).pack(
+                side="right", padx=(0, 8))
 
         self.entry.bind("<KeyRelease>", self._on_key)
         self.entry.bind("<Return>", lambda e: self.search())
@@ -2846,15 +3175,30 @@ class AddCardDialog(tk.Toplevel):
             pass
         self.entry.focus_set()
 
-        if cards:
+        if cards and replay:       # batch mode already read this card: show what it found
+            self.msg_var.set("Check the guess below.")
+            self.after(40, lambda: self._replay(list(replay)))
+        elif cards:
             self.msg_var.set({"standard": "Reading the card...", "land": "Reading the land...",
                               "token": "Reading the token..."}.get(mode, "Reading the card..."))
             self._stream(lambda emit: recognize(self.cards, self.catalog, self.debug_dir, emit=emit,
                                                 mode=self.mode, sets=self.sets, types=self.types,
-                                                read_number=self.read_number),
+                                                read_number=self.read_number,
+                                                number_first=self.number_first),
                          self._on_stage)
         else:
             self.msg_var.set("Type a few letters of the card name - suggestions appear as you type.")
+
+    def _set_aside(self):
+        self.aside = True
+        self.destroy()
+
+    def _replay(self, events):
+        if not self._alive():
+            return
+        for kind, val in events:
+            self._on_stage(kind, val)
+        self._on_stage("done", {"notes": []})
 
     # ---------------------------------------------------------- background work
     def _alive(self):
@@ -2930,7 +3274,7 @@ class AddCardDialog(tk.Toplevel):
                 self.set_var.set(str(hit.get("set_code", "")).upper())
                 self.num_var.set(str(hit.get("number", "")))
                 self.msg_var.set(f"The set and number on the card say {hit['set']} #{hit['number']}. "
-                                 "Check it matches, then press Add card (Ctrl+Enter).")
+                                 "Check it matches, then press the green button (Ctrl+Enter).")
             else:
                 self.msg_var.set("Best guess is highlighted. Not right? Pick another, or type the name.")
             self._pick_top()
@@ -2958,7 +3302,7 @@ class AddCardDialog(tk.Toplevel):
             self.num_var.set(str(h.get("number", "")))
             if self.matches[0].get("sid") == h.get("sid"):
                 self.msg_var.set(f"{val.get('note', '')}The set and number on the card say "
-                                 f"{h['set']} #{h['number']}. Check it matches, then press Add card (Ctrl+Enter).")
+                                 f"{h['set']} #{h['number']}. Check it matches, then press the green button (Ctrl+Enter).")
             else:   # the print says one thing, the artwork / text another: let the person decide
                 top = self.matches[0]
                 self.msg_var.set(f"{val.get('note', '')}The number on the card says {h['set']} #{h['number']}, "
@@ -3143,7 +3487,7 @@ class AddCardDialog(tk.Toplevel):
             self.tree.selection_set(str(want))
             self.tree.see(str(want))
             self.msg_var.set(f"Matched by the set and number on the card: {val[want]['set']} "
-                             f"#{val[want]['number']}. Check it, then press Add card (Ctrl+Enter).")
+                             f"#{val[want]['number']}. Check it, then press the green button (Ctrl+Enter).")
             return
         if self.photo_art is not None and len(val) > 1:
             self.msg_var.set(f"{len(val)} printings found - comparing artwork...")
@@ -3333,6 +3677,16 @@ class SettingsWindow(tk.Toplevel):
                         variable=self.num_var,
                         command=lambda: self.app.set_option("read_number", bool(self.num_var.get()))
                         ).pack(anchor="w", pady=(0, 6))
+        self.first_var = tk.BooleanVar(value=self.app.number_first)
+        ttk.Checkbutton(f, text="Read the set code first when the picture is sharp (faster)",
+                        variable=self.first_var,
+                        command=lambda: self.app.set_option("number_first", bool(self.first_var.get()))
+                        ).pack(anchor="w")
+        ttk.Label(f, style="PanelMuted.TLabel", justify="left", wraplength=460, text=(
+            "Turn this off if your camera is low pixel count or blurry. With a clear picture the "
+            "set code and number can identify a card faster; with a blurry one the small print "
+            "can't be read and the app just falls back to the normal order.")).pack(
+            anchor="w", pady=(2, 10), padx=(24, 0))
         ttk.Checkbutton(f, text="Look for updates when the app starts", variable=self.upd_var,
                         command=lambda: self.app.set_option("check_updates", bool(self.upd_var.get()))
                         ).pack(anchor="w")
@@ -3599,6 +3953,10 @@ class ScannerApp:
         self.types = TypeCatalog(TYPES_FILE)
         self.types.start()
         self.read_number = bool(self.settings.get("read_number", True))
+        self.number_first = bool(self.settings.get("number_first", True))
+        self.commanders = clean_commanders(self.settings.get("commanders"), list_decks())
+        self.scan_action = tk.StringVar(value=self.settings.get("scan_action")
+                                        if self.settings.get("scan_action") in dict(SCAN_ACTIONS) else "add")
         self.card_mode = tk.StringVar(value=self.settings.get("card_mode", "standard")
                                       if self.settings.get("card_mode") in dict(CARD_MODES) else "standard")
 
@@ -3712,7 +4070,7 @@ class ScannerApp:
         opt = ttk.Frame(cam, style="Panel.TFrame")
         opt.pack(fill="x", pady=(12, 0))
         ttk.Label(opt, text="Capture", style="PanelMuted.TLabel").pack(side="left", padx=(0, 8))
-        for text, val in (("Manual", "manual"), ("Auto", "auto")):
+        for text, val in (("Manual", "manual"), ("Auto", "auto"), ("Batch", "batch")):
             ttk.Radiobutton(opt, text=text, value=val, variable=self.mode_var,
                             style="Seg.Toolbutton", command=self.on_mode_change,
                             takefocus=0).pack(side="left", padx=(0, 2))
@@ -3727,6 +4085,13 @@ class ScannerApp:
         for val, text in CARD_MODES:
             ttk.Radiobutton(opt2, text=text, value=val, variable=self.card_mode,
                             style="Seg.Toolbutton", command=self.on_card_mode_change,
+                            takefocus=0).pack(side="left", padx=(0, 2))
+        opt3 = ttk.Frame(cam, style="Panel.TFrame")
+        opt3.pack(fill="x", pady=(8, 0))
+        ttk.Label(opt3, text="When scanned", style="PanelMuted.TLabel").pack(side="left", padx=(0, 8))
+        for val, text in SCAN_ACTIONS:
+            ttk.Radiobutton(opt3, text=text, value=val, variable=self.scan_action,
+                            style="Seg.Toolbutton", command=self.on_scan_action_change,
                             takefocus=0).pack(side="left", padx=(0, 2))
         self.cam_toggle = ttk.Button(opt, text="Camera  v", style="Link.TButton",
                                      command=self.toggle_camera_settings, takefocus=0)
@@ -3834,6 +4199,8 @@ class ScannerApp:
 
         btns2 = ttk.Frame(panel, style="Panel.TFrame")
         btns2.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(btns2, text="\u2605 Commander", command=self.toggle_commander,
+                   takefocus=0).pack(side="left", padx=(0, 6))
         ttk.Button(btns2, text="Export for websites...", command=self.export_sites,
                    takefocus=0).pack(side="left")
 
@@ -4025,7 +4392,8 @@ class ScannerApp:
         self.apply_keybinds()
 
     def key_actions(self):
-        return {"snap": self.snap, "auto": self.toggle_mode, "finish": self.toggle_finish, "card_mode": self.toggle_card_mode,
+        return {"snap": self.snap, "auto": self.toggle_mode, "finish": self.toggle_finish, "card_mode": self.toggle_card_mode, "scan_action": self.toggle_scan_action,
+            "batch_mode": self.toggle_batch, "commander": self.toggle_commander,
                 "phone": self.open_phone, "photo": self.scan_file, "add_name": self.add_by_name,
                 "qty_up": lambda: self.change_qty(1), "qty_down": lambda: self.change_qty(-1),
                 "new_deck": self.new_deck, "next_deck": self.next_deck, "flip": self.flip_selected, "remove": self.remove_selected,
@@ -4071,6 +4439,24 @@ class ScannerApp:
         self.finish.set("nonfoil" if self.finish.get() == "foil" else "foil")
         self.on_finish_change()
 
+    def on_scan_action_change(self):
+        self.settings["scan_action"] = self.scan_action.get()
+        save_json(SETTINGS_FILE, self.settings)
+        self.set_status({"add": "Scanned cards are added to the deck you are showing.",
+                         "find": "Scan a card to see which deck it is in and how many you have.",
+                         "commander": "Scan a card to jump to the deck that has it as its commander."
+                         }[self.scan_action.get()])
+        self.canvas.focus_set()
+
+    def toggle_scan_action(self):
+        ids = [a for a, _ in SCAN_ACTIONS]
+        self.scan_action.set(ids[(ids.index(self.scan_action.get()) + 1) % len(ids)])
+        self.on_scan_action_change()
+
+    def toggle_batch(self):
+        self.mode_var.set("manual" if self.mode_var.get() == "batch" else "batch")
+        self.on_mode_change()
+
     def on_card_mode_change(self):
         self.settings["card_mode"] = self.card_mode.get()
         save_json(SETTINGS_FILE, self.settings)
@@ -4098,6 +4484,8 @@ class ScannerApp:
             self.check_updates = bool(value)
         elif name == "read_number":
             self.read_number = bool(value)
+        elif name == "number_first":
+            self.number_first = bool(value)
 
     def open_settings(self):
         if self.busy:
@@ -4189,8 +4577,11 @@ class ScannerApp:
         save_json(SETTINGS_FILE, self.settings)
         self.auto_t0 = None
         self.auto_armed = True
-        self.set_status("Auto mode: hold a card still in the frame and it is captured for you "
-                        "to confirm." if self.mode_var.get() == "auto" else "Manual mode: press Space to snap.")
+        self.set_status({"auto": "Auto mode: hold a card still in the frame and it is captured for you "
+                                 "to confirm.",
+                         "batch": "Batch mode: spread several cards out on a plain, light table without touching, "
+                                  "keep them all in view and press Space once."
+                         }.get(self.mode_var.get(), "Manual mode: press Space to snap."))
         self.canvas.focus_set()
 
     def on_finish_change(self):
@@ -4256,7 +4647,9 @@ class ScannerApp:
             if c["finish"] == "foil":
                 tags.append("foil")
             self.tree.insert("", "end", iid=c["id"], tags=tags, values=(
-                c["qty"], c["name"], main_type(c), color_text(c), c["set"],
+                c["qty"], ("\u2605 " if any(front_key(n) == front_key(c["name"])
+                                            for n in self.commanders.get(self.deck, [])) else "") + c["name"],
+                main_type(c), color_text(c), c["set"],
                 finish_text(c), money(c["price"]), money(line_total(c))))
         keep = [i for i in keep_selection if self.tree.exists(i)]
         if keep:
@@ -4348,7 +4741,9 @@ class ScannerApp:
             return
         self.deck = name
         self.settings["deck"] = name
-        save_json(SETTINGS_FILE, self.settings)
+        if old in self.commanders:
+            self.commanders[name] = self.commanders.pop(old)
+        self._save_commanders()
         self._decks_changed()
         self.set_status(f"Renamed to {name}")
         self.canvas.focus_set()
@@ -4375,6 +4770,8 @@ class ScannerApp:
             messagebox.showerror(APP_NAME, f"Couldn't delete the deck:\n{e}")
             return
         rest = list_decks()
+        self.commanders.pop(gone, None)
+        self._save_commanders()
         self.deck = rest[0]
         self.cards = load_cards(deck_path(self.deck))
         self.settings["deck"] = self.deck
@@ -4392,6 +4789,10 @@ class ScannerApp:
             messagebox.showinfo(APP_NAME, "The camera isn't working yet, so there's nothing "
                                 "to snap. You can use Phone..., Photo file... or Add by name / "
                                 "number... instead.")
+            return
+        if self.mode_var.get() == "batch":
+            frame = max(list(self.frame_buffer)[-6:], key=lambda t: sharpness_score(t[1]))[1]
+            self.run_batch(frame)
             return
         best = sorted(self.frame_buffer, key=lambda t: -t[0])[:3]   # sharpest frames first
         cards = [extract_card(frame, quad) for _, frame, quad in best]
@@ -4412,22 +4813,30 @@ class ScannerApp:
         if img is None:
             messagebox.showerror(APP_NAME, "Couldn't open that picture.")
             return
+        if self.mode_var.get() == "batch":
+            self.run_batch(img)
+            return
         self.run_add_dialog([extract_card(img, None, frac=1.0)])
 
     def add_by_name(self):
         if not self.busy:
             self.run_add_dialog([])
 
-    def run_add_dialog(self, cards):
-        """Open the confirm window. Returns the card as stored (or None if cancelled)."""
+    def run_add_dialog(self, cards, replay=None, position="", allow_aside=False, purpose=None):
+        """Open the confirm window. What happens next depends on 'When scanned': add the card
+        (returned as stored), or look it up. None if cancelled; ASIDE if put at the back."""
+        purpose = purpose or self.scan_action.get()
         self.busy = True
         try:
             dlg = AddCardDialog(self.root, cards, self.catalog, self.finish.get(),
                                 DEBUG_DIR if self.debug_var.get() else None,
                                 mode=self.card_mode.get(), sets=self.sets, types=self.types,
-                                read_number=self.read_number)
+                                read_number=self.read_number, number_first=self.number_first,
+                                purpose=purpose, replay=replay, position=position,
+                                allow_aside=allow_aside)
             self.root.wait_window(dlg)
             card = dlg.result
+            aside = bool(getattr(dlg, "aside", False))
         finally:
             self.busy = False
             self.auto_armed = False        # auto mode waits until the card is taken away
@@ -4436,8 +4845,16 @@ class ScannerApp:
             self.canvas.focus_set()
         except tk.TclError:
             pass
+        if aside:
+            return ASIDE
         if not card:
             self.set_status("Cancelled - nothing added.")
+            return None
+        if purpose == "find":
+            self.show_find(card)
+            return None
+        if purpose == "commander":
+            self.go_commander(card)
             return None
 
         card["id"] = f"c{time.time_ns()}"
@@ -4458,6 +4875,164 @@ class ScannerApp:
             f"Added {card['qty']}x {card['name']} ({finish_text(card)}) - {money(card['price'])} each"
             + (f".  You now have {stored['qty']}." if stored is not card else "."))
         return stored
+
+    # -------------------------------------------------------- batch mode
+    def run_batch(self, frame):
+        """Several cards in one picture: cut them out, read them all, then confirm one by one.
+        Cards that can't be told go to the back of the line. Returns how many were added."""
+        if self.scan_action.get() != "add":
+            messagebox.showinfo(APP_NAME, "Batch mode adds cards to a deck. Set 'When scanned' to "
+                                "'Add to deck' first.")
+            return 0
+        quads = find_cards(frame)
+        if not quads:
+            messagebox.showinfo(APP_NAME, "I couldn't find any cards in that picture. Spread the cards "
+                                "out on a plain, light-coloured table (card borders are black) so they don't touch, keep them all in view "
+                                "and in good light, then try again.")
+            return 0
+        cards = [warp_card(frame, q) for q in quads]
+        # read these now: the background thread must not touch the screen's variables
+        opts = dict(mode=self.card_mode.get(), sets=self.sets, types=self.types, read_number=self.read_number,
+                    number_first=self.number_first)
+        debug = DEBUG_DIR if self.debug_var.get() else None
+        items = []
+
+        def worker(progress, cancelled):
+            for i, card in enumerate(cards):
+                if cancelled():
+                    break
+                progress(i, f"Reading card {i + 1} of {len(cards)}...")
+                events = []
+                try:
+                    res = recognize([card], self.catalog, debug, True,
+                                    lambda kind, val, ev=events: ev.append((kind, val)), **opts)
+                except Exception:  # noqa: BLE001 - this card is simply set aside
+                    res = None
+                items.append({"index": i, "card": card, "events": events, "res": res,
+                              "ok": batch_confident(res)})
+            progress(len(cards), "Done reading.")
+
+        self.busy = True
+        try:
+            win = BatchWindow(self.root, len(cards), worker)
+            self.root.wait_window(win)
+        finally:
+            self.busy = False
+        if not items:
+            self.set_status("Batch stopped before any card was read.")
+            return 0
+        return self.review_batch(items)
+
+    def review_batch(self, items):
+        """Confirm the cards one by one: the ones it could tell first, the rest at the back."""
+        queue_ = [i for i in items if i["ok"]] + [i for i in items if not i["ok"]]
+        total, added, skipped, aside_n = len(items), 0, 0, 0
+        while queue_:
+            it = queue_.pop(0)
+            pos = f"Card {it['index'] + 1} of {total}" + ("   (couldn't tell at first)" if not it["ok"] else "")
+            out = self.run_add_dialog([it["card"]], replay=it["events"] if it["res"] else None,
+                                      position=pos, allow_aside=not it.get("aside"), purpose="add")
+            if out == ASIDE:
+                it["aside"] = True
+                aside_n += 1
+                queue_.append(it)
+            elif out:
+                added += 1
+            else:
+                skipped += 1
+        self.set_status(f"Batch finished: {added} added, {skipped} skipped"
+                        + (f", {aside_n} set aside and handled last." if aside_n else "."))
+        return added
+
+    # ------------------------------------------------------ find and commander
+    def _all_decks(self):
+        return {n: (self.cards if n == self.deck else load_cards(deck_path(n))) for n in list_decks()}
+
+    def goto_card(self, deck, card_id):
+        if deck != self.deck:
+            self.switch_deck(deck)
+        if self.deck == deck and card_id and self.tree.exists(card_id):
+            self.tree.selection_set(card_id)
+            self.tree.see(card_id)
+
+    def show_find(self, card):
+        """Scan a card, see which decks it is in and how many you have."""
+        hits = locate_card(card["name"], self._all_decks())
+        each = lambda v: money(v) if v else "n/a"          # noqa: E731
+        info = [card["name"],
+                "  -  ".join(x for x in (card.get("type_line", ""), str(card.get("rarity", "")).title()) if x),
+                f"The card you scanned: {card.get('set', '?')} #{card.get('number', '')}   "
+                f"non-foil {each(card.get('price_nonfoil'))}   foil {each(card.get('price_foil'))}"]
+        if not hits:
+            messagebox.showinfo(APP_NAME, f"{card['name']} isn't in any of your decks.\n\n" + "\n".join(info[1:]))
+            self.set_status(f"{card['name']}: not in any deck.")
+            return
+        owned = sum(c["qty"] for _, c in hits)
+        decks_n = len({d for d, _ in hits})
+        info.append(f"You have {owned} cop{'y' if owned == 1 else 'ies'} in {decks_n} deck{'s' if decks_n != 1 else ''}"
+                    " (an exact match is marked *).")
+        rows = []
+        for d, c in hits:
+            exact = c.get("set_code") and c.get("set_code") == card.get("set_code") and \
+                same_number(c.get("number", ""), card.get("number", ""))
+            rows.append((d, c["id"], c["qty"], finish_text(c), c["set"] + (" *" if exact else ""),
+                         c.get("number", ""), each(c.get("price"))))
+        self.set_status(f"{card['name']}: {owned} in {decks_n} deck{'s' if decks_n != 1 else ''}.")
+        DeckResultsWindow(self.root, "Where is this card?", info, rows, self.goto_card)
+
+    def go_commander(self, card):
+        """Scan a commander, jump to its deck."""
+        names = commander_decks(self.commanders, card["name"])
+        if not names:
+            messagebox.showinfo(APP_NAME, f"None of your decks has {card['name']} as its commander.\n\n"
+                                "Open the deck, click the card in the list and press 'Commander' "
+                                "(key C) to set it.")
+            self.set_status(f"{card['name']} isn't set as a commander in any deck.")
+            return
+        decks = self._all_decks()
+        rows = []
+        for d in names:
+            mine = [c for c in decks.get(d, []) if front_key(c["name"]) == front_key(card["name"])]
+            c = mine[0] if mine else {}
+            rows.append((d, c.get("id", ""), c.get("qty", ""), finish_text(c) if c else "", c.get("set", ""),
+                         c.get("number", ""), money(c["price"]) if c.get("price") else ""))
+        if len(rows) == 1:
+            self.goto_card(rows[0][0], rows[0][1])
+            self.set_status(f"{card['name']} is the commander of {rows[0][0]}.")
+        else:
+            DeckResultsWindow(self.root, "Decks with this commander",
+                              [card["name"], f"It is the commander of {len(rows)} decks."], rows, self.goto_card)
+
+    def _save_commanders(self):
+        self.settings["commanders"] = self.commanders
+        save_json(SETTINGS_FILE, self.settings)
+
+    def toggle_commander(self):
+        sel = self.selected_cards()
+        if not sel:
+            messagebox.showinfo(APP_NAME, "Click a card in the list first, then press Commander.")
+            return
+        mine = self.commanders.setdefault(self.deck, [])
+        done = []
+        for c in sel:
+            key = front_key(c["name"])
+            present = [n for n in mine if front_key(n) == key]
+            if present:
+                mine.remove(present[0])
+                done.append(f"{c['name']} is no longer a commander")
+            elif len(mine) >= 2:
+                messagebox.showinfo(APP_NAME, "A deck can have at most two commanders (partners). "
+                                    "Remove one first.")
+                break
+            else:
+                mine.append(c["name"])
+                done.append(f"{c['name']} is now a commander of {self.deck}")
+        if not mine:
+            self.commanders.pop(self.deck, None)
+        self._save_commanders()
+        self.refresh_table(keep_selection=[c["id"] for c in sel])
+        if done:
+            self.set_status(".  ".join(done) + ".")
 
     def add_to_collection(self, card):
         """Scanning the same printing again adds to its quantity instead of a new row."""
@@ -4567,6 +5142,10 @@ class ScannerApp:
 
     def handle_phone_photo(self, link, job, img, live=False):
         # live frames are framed by the phone's card-shaped guide; photos are the whole picture
+        if self.mode_var.get() == "batch" and not live and self.scan_action.get() == "add":
+            n = self.run_batch(img)
+            link.set_status(job, "added" if n else "skipped", f"{n} cards" if n else "")
+            return
         card = self.run_add_dialog([extract_card(img, None, frac=BOX_HEIGHT_FRACTION if live else 1.0)])
         if card:
             link.set_status(job, "added", f"{card['name']} - {money(card['price'])}")
