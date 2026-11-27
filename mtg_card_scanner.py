@@ -50,6 +50,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import zipfile
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -105,6 +106,8 @@ DATA_DIR = Path.home() / "Documents" / "MTG Card Scanner"
 SCANS_DIR = DATA_DIR / "Scans"
 EXPORT_DIR = DATA_DIR / "Exports"
 DEBUG_DIR = DATA_DIR / "Debug"
+BACKUP_DIR = DATA_DIR / "Backups"
+RECENT_FILE = DATA_DIR / "recent_adds.json"
 CARDS_FILE = DATA_DIR / "cards.json"          # the old single list; becomes the first deck
 DECKS_DIR = DATA_DIR / "Decks"
 DEFAULT_DECK = "My Collection"
@@ -333,6 +336,31 @@ THEMES = {
                           accent_hi="#ffe45c", accent_lo="#c9a600", stripe="#101010", gold="#ffd400"),
 }
 THEME_NAMES = list(THEMES)
+
+# Performance: how much work the live picture does. "ms" = time between preview frames,
+# "detect_every" = look for the card outline on every Nth frame, "buffer" = recent frames kept
+# for picking the sharpest one, "pause_busy" = freeze the preview while a card is being read.
+PERF_LEVELS = {
+    "Smooth": dict(ms=33, detect_every=3, buffer=6, pause_busy=False, fast_resize=False, art_motion=True),
+    "Balanced": dict(ms=50, detect_every=4, buffer=5, pause_busy=True, fast_resize=True, art_motion=True),
+    "Light": dict(ms=100, detect_every=8, buffer=4, pause_busy=True, fast_resize=True, art_motion=False),
+}
+PERF_TEXT = {
+    "Smooth": "Smooth - live picture at about 30 frames a second. For a computer with a few cores to spare.",
+    "Balanced": "Balanced - about 20 frames a second, and the picture holds still while a card is read.",
+    "Light": "Light - about 10 frames a second, the card outline is checked less often, header motion is "
+             "off. For older laptops and basic office PCs.",
+}
+
+
+def suggest_perf(cpus=None):
+    n = cpus if cpus is not None else (os.cpu_count() or 4)
+    return "Light" if n <= 2 else "Balanced" if n <= 4 else "Smooth"
+
+
+def load_perf(settings):
+    v = settings.get("performance") if isinstance(settings, dict) else None
+    return v if v in PERF_LEVELS else suggest_perf()
 TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15}
 ROW_HEIGHTS = {"Compact": 24, "Normal": 30, "Roomy": 38}
 ART_MODES = [("theme", "Theme art"), ("none", "No art"), ("custom", "My picture")]
@@ -675,6 +703,7 @@ def _oracle_text(c):
 def _parse_scryfall(c):
     p = c.get("prices", {})
     return {
+        "cmc": float(c.get("cmc") or 0),
         "name": c["name"],
         "set": c.get("set_name", "?"),
         "number": c.get("collector_number", ""),
@@ -1046,6 +1075,7 @@ ACTIONS = [
     ("export_view", "Export the current view", "Control-e"),
     ("export_all", "Export all cards", ""),
     ("export_sites", "Export for other websites", ""),
+    ("undo", "Undo the last card added", "Control-z"),
     ("settings", "Open Settings", "Control-comma"),
     ("update", "Check for updates", ""),
     ("exit", "Exit the app", "Control-q"),
@@ -2409,6 +2439,10 @@ def save_debug(debug_dir, cards, reads, cands, res=None):
                 write_image(d / f"crop_{name}.jpg", _prep_strip(cards[0], box, 2.0))
             except Exception:
                 pass
+    try:
+        prune_debug(debug_dir, DEBUG_KEEP)
+    except Exception:  # noqa: BLE001 - tidying up must never break a scan
+        pass
 
 
 def rank_printings_by_art(photo_art, matches, limit=12):
@@ -2587,6 +2621,412 @@ def write_site_csv(path, rows, name_map):
                         code.upper(), c.get("number", ""), "foil" if c.get("finish") == "foil" else "",
                         c.get("sid", "")])
     return missing
+
+
+# ------------------------------------------------------ storage: diagnostics and backups
+DEBUG_KEEP_CHOICES = [30, 20, 10, 5, 0]          # 0 = keep everything
+DEBUG_KEEP_DEFAULT = 20
+DEBUG_KEEP = DEBUG_KEEP_DEFAULT                  # the app sets this from Settings
+_DEBUG_RUN_RE = re.compile(r"^\d{8}_\d{6}_\d{6}$")
+
+
+def load_keep(settings):
+    v = settings.get("keep_diagnostics") if isinstance(settings, dict) else None
+    return v if v in DEBUG_KEEP_CHOICES else DEBUG_KEEP_DEFAULT
+
+
+def dir_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def format_size(n):
+    if n < 1024 * 1024:
+        return f"{max(1, n // 1024) if n else 0} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def debug_runs(debug_dir):
+    """The diagnostic folders (one per scan), oldest first."""
+    try:
+        return sorted(p for p in Path(debug_dir).iterdir() if p.is_dir() and _DEBUG_RUN_RE.match(p.name))
+    except OSError:
+        return []
+
+
+def prune_debug(debug_dir, keep):
+    """Delete all but the newest `keep` diagnostic scans. Returns (folders removed, bytes freed)."""
+    if not keep or keep <= 0:
+        return 0, 0
+    runs = debug_runs(debug_dir)
+    gone, freed = 0, 0
+    for d in runs[:-keep] if len(runs) > keep else []:
+        size = dir_size(d)
+        shutil.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            gone += 1
+            freed += size
+    return gone, freed
+
+
+class BackupError(Exception):
+    pass
+
+
+_BACKUP_DECK_RE = re.compile(r"^Decks/([^/\\]+)\.json$")
+_BACKUP_SCAN_RE = re.compile(r"^Scans/([^/\\]+\.jpg)$")
+
+
+def make_backup(zip_path, include_scans=False):
+    """Zip the decks and settings (and optionally the scan pictures). Returns (decks, bytes)."""
+    zip_path = Path(zip_path)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(zip_path) + ".tmp")
+    names = list_decks()
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        for n in names:
+            z.write(deck_path(n), f"Decks/{n}.json")
+        if SETTINGS_FILE.exists():
+            z.write(SETTINGS_FILE, "settings.json")
+        if include_scans and SCANS_DIR.exists():
+            for f in sorted(SCANS_DIR.glob("*.jpg")):
+                z.write(f, f"Scans/{f.name}")
+        z.writestr("backup_info.json", json.dumps(
+            {"app": APP_NAME, "version": APP_VERSION, "made": datetime.datetime.now().isoformat(timespec="seconds"),
+             "decks": names, "scans": bool(include_scans)}, indent=2))
+    os.replace(tmp, zip_path)
+    return len(names), zip_path.stat().st_size
+
+
+def inspect_backup(zip_path):
+    """Check a backup is one of ours and safe to read. Returns {'decks': {name: card count}, 'scans': n}."""
+    try:
+        z = zipfile.ZipFile(zip_path)
+    except (OSError, zipfile.BadZipFile):
+        raise BackupError("That file isn't a backup made by this app.") from None
+    with z:
+        infos = z.infolist()
+        if sum(i.file_size for i in infos) > 2_000_000_000:
+            raise BackupError("That backup is far too large to be one of ours.")
+        decks, scans = {}, 0
+        for i in infos:
+            m = _BACKUP_DECK_RE.match(i.filename)
+            if m:
+                name = m.group(1)
+                if clean_deck_name(name) != name or deck_name_problem(name):
+                    raise BackupError(f"The backup has a deck with an unusable name ({name!r}).")
+                if i.file_size > 80_000_000:
+                    raise BackupError("A deck in that backup is too large to be real.")
+                try:
+                    data = json.loads(z.read(i).decode("utf-8"))
+                except (ValueError, UnicodeDecodeError, zipfile.BadZipFile):
+                    raise BackupError(f"The deck {name} in that backup is damaged.") from None
+                if not isinstance(data, list):
+                    raise BackupError(f"The deck {name} in that backup isn't a card list.")
+                decks[name] = len(data)
+            elif _BACKUP_SCAN_RE.match(i.filename):
+                scans += 1
+        if not decks:
+            raise BackupError("That file isn't a backup made by this app (no decks inside).")
+    return {"decks": decks, "scans": scans}
+
+
+def restore_backup(zip_path):
+    """Put a backup's decks back. Decks with the same name are replaced; other decks stay.
+    A safety copy of what you have now is saved in Backups first.
+    Returns {'decks': [...], 'commanders': {...}, 'safety': Path}."""
+    info = inspect_backup(zip_path)
+    ensure_dirs()
+    safety = BACKUP_DIR / f"before-restore-{datetime.datetime.now():%Y%m%d-%H%M%S}.zip"
+    make_backup(safety)
+    commanders = {}
+    with zipfile.ZipFile(zip_path) as z:
+        for name in info["decks"]:
+            target = deck_path(name)
+            tmp = Path(str(target) + ".tmp")
+            tmp.write_bytes(z.read(f"Decks/{name}.json"))
+            os.replace(tmp, target)
+        if "settings.json" in z.namelist():
+            try:
+                saved = json.loads(z.read("settings.json").decode("utf-8"))
+                commanders = clean_commanders(saved.get("commanders"), list(info["decks"]))
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                commanders = {}
+        for i in z.infolist():
+            m = _BACKUP_SCAN_RE.match(i.filename)
+            if m and not (SCANS_DIR / m.group(1)).exists():
+                SCANS_DIR.mkdir(parents=True, exist_ok=True)
+                (SCANS_DIR / m.group(1)).write_bytes(z.read(i))
+    return {"decks": list(info["decks"]), "commanders": commanders, "safety": safety}
+
+
+AUTO_BACKUP_KEEP = 5
+
+
+def auto_backup(keep=AUTO_BACKUP_KEEP):
+    """A backup when the app closes; only the newest few are kept."""
+    path = BACKUP_DIR / f"auto-backup-{datetime.datetime.now():%Y%m%d-%H%M%S}.zip"
+    make_backup(path)
+    olds = sorted(BACKUP_DIR.glob("auto-backup-*.zip"))
+    for f in olds[:-keep] if len(olds) > keep else []:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return path
+
+
+# ------------------------------------------------------------ prices over time
+def price_identifier(c, name_map):
+    """How to ask Scryfall for exactly this card: by its id, else set + number, else name."""
+    if c.get("sid"):
+        return {"id": c["sid"]}
+    code = card_set_code(c, name_map)
+    if code and c.get("number"):
+        return {"set": code, "collector_number": str(c["number"]).lstrip("0") or "0"}
+    return {"name": str(c["name"]).split(" // ")[0]}
+
+
+def unique_identifiers(cards, name_map):
+    seen, out = set(), []
+    for c in cards:
+        ident = price_identifier(c, name_map)
+        key = json.dumps(ident, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(ident)
+    return out
+
+
+def fetch_price_records(identifiers, progress=None):
+    """Current Scryfall records for the identifiers (75 per request, politely)."""
+    out = []
+    for i in range(0, len(identifiers), 75):
+        r = scryfall("POST", "/cards/collection", json={"identifiers": identifiers[i:i + 75]})
+        if r.status_code != 200:
+            raise RuntimeError(f"Scryfall answered {r.status_code}")
+        out.extend(r.json().get("data", []))
+        if progress:
+            progress(min(len(identifiers), i + 75), len(identifiers))
+    return out
+
+
+def apply_price_update(cards, records, name_map, now=None):
+    """Write new prices into the cards. Returns {'changed': [(card, old, new)], 'missing': n}.
+    The first time a card is refreshed its old price becomes its 'price when added' baseline."""
+    by_id = {r.get("id"): r for r in records}
+    by_num = {(str(r.get("set", "")).lower(), str(r.get("collector_number", "")).lower()): r for r in records}
+    by_name = {}
+    for r in records:
+        by_name.setdefault(norm(str(r.get("name", "")).split(" // ")[0]), r)
+    changed, missing = [], 0
+    for c in cards:
+        rec = by_id.get(c.get("sid"))
+        if rec is None:
+            code = card_set_code(c, name_map)
+            if code and c.get("number"):
+                rec = by_num.get((code, str(c["number"]).lstrip("0").lower() or "0"))
+        if rec is None and not c.get("sid"):
+            rec = by_name.get(front_key(c["name"]))
+        if rec is None:
+            missing += 1
+            continue
+        parsed = _parse_scryfall(rec)
+        old = c["price"]
+        c.setdefault("price_added", old)
+        c["price_nonfoil"], c["price_foil"] = parsed["price_nonfoil"], parsed["price_foil"]
+        c["cmc"] = parsed["cmc"]
+        c.setdefault("sid", parsed["sid"])
+        c.setdefault("set_code", parsed["set_code"])
+        apply_finish(c, c["finish"])
+        c["price_checked"] = now if now is not None else time.time()
+        changed.append((c, old, c["price"]))
+    return {"changed": changed, "missing": missing}
+
+
+def price_change(c):
+    """Each-price change since the card was added (0 when nothing is known yet)."""
+    base = c.get("price_added")
+    return 0.0 if base is None else round(c["price"] - base, 2)
+
+
+def format_change(c):
+    d = price_change(c)
+    return "" if abs(d) < 0.005 else (f"+${d:,.2f}" if d > 0 else f"-${-d:,.2f}")
+
+
+def value_summary(cards):
+    """(value now, value when added, change) for a list of cards."""
+    now = sum(line_total(c) for c in cards)
+    then = sum(c.get("price_added", c["price"]) * c["qty"] for c in cards)
+    return round(now, 2), round(then, 2), round(now - then, 2)
+
+
+def last_price_check(cards):
+    t = max((c.get("price_checked", 0) for c in cards), default=0)
+    return t or None
+
+
+# ------------------------------------------------------------ recent adds and undo
+RECENT_MAX = 20
+
+
+def load_recent():
+    items = load_json(RECENT_FILE, [])
+    ok = [e for e in items if isinstance(e, dict) and e.get("deck") and e.get("row") and e.get("qty")] if isinstance(items, list) else []
+    return ok[:RECENT_MAX]
+
+
+def add_recent(recent, deck, stored, qty, image="", now=None):
+    """New entry at the front (the list keeps the latest RECENT_MAX)."""
+    entry = {"deck": deck, "row": stored["id"], "name": stored["name"], "set": stored.get("set", ""),
+             "number": stored.get("number", ""), "finish": stored.get("finish", "nonfoil"),
+             "qty": int(qty), "image": image or "", "t": now if now is not None else time.time()}
+    return ([entry] + list(recent))[:RECENT_MAX]
+
+
+def undo_add(cards, entry):
+    """Take an add back out of a card list. Returns None when the card can't be found, otherwise
+    {'cards': new list, 'removed': bool, 'left': quantity left, 'drop_images': [file names]}."""
+    row = next((c for c in cards if c.get("id") == entry["row"]), None)
+    if row is None:
+        row = next((c for c in cards if (c["name"], c["set"], c.get("number", ""), c["finish"]) ==
+                    (entry["name"], entry["set"], entry.get("number", ""), entry["finish"])), None)
+    if row is None:
+        return None
+    row["qty"] -= entry["qty"]
+    drop = []
+    if entry.get("image") and entry["image"] != row.get("image"):
+        drop.append(entry["image"])                      # a picture only this add used
+    if row["qty"] <= 0:
+        if row.get("image"):
+            drop.append(row["image"])
+        return {"cards": [c for c in cards if c is not row], "removed": True, "left": 0, "drop_images": drop}
+    return {"cards": cards, "removed": False, "left": row["qty"], "drop_images": drop}
+
+
+# ------------------------------------------------------------ importing a deck list
+_SECTION_RE = re.compile(r"^(deck|main(?:board)?|commander|companion|sideboard|maybeboard|considering|about|name.*)\s*:?\s*$", re.I)
+_QTY_RE = re.compile(r"^(\d+)\s*[xX]?\s+(.+)$")
+_SETNUM_RE = re.compile(r"^(.*?)\s+\(([A-Za-z0-9]{2,6})\)\s*([A-Za-z0-9★\-]*)\s*$")
+
+
+def _parse_card_line(line):
+    qty = 1
+    m = _QTY_RE.match(line)
+    if m:
+        qty, line = int(m.group(1)), m.group(2).strip()
+    foil = bool(re.search(r"\*[FE]\*\s*$|\bfoil\s*$", line, re.I))
+    line = re.sub(r"\s*\*[FE]\*\s*$|\s+foil\s*$", "", line, flags=re.I)
+    line = re.sub(r"\s*\^[^^]*\^", "", line)           # Moxfield / Archidekt tags
+    line = re.sub(r"\s*\[[^\]]*\]\s*$", "", line).strip()
+    set_code = number = ""
+    m = _SETNUM_RE.match(line)
+    if m:
+        line, set_code, number = m.group(1).strip(), m.group(2).lower(), m.group(3).strip()
+    return {"qty": max(1, qty), "name": line, "set": set_code, "number": number, "foil": foil}
+
+
+def parse_decklist(text):
+    """A pasted list from a deck site -> [{'qty','name','set','number','foil','section'}]."""
+    lines = [ln.strip() for ln in str(text or "").replace("\r", "").split("\n")]
+    entries, section = [], "main"
+    first = next((ln for ln in lines if ln), "")
+    if "," in first and re.search(r"\bname\b", first, re.I) and re.search(r"\b(count|qty|quantity)\b", first, re.I):
+        for row in csv.DictReader(io.StringIO("\n".join(lines))):
+            low = {str(k).strip().lower(): (v or "").strip() for k, v in row.items() if k}
+            name = low.get("name", "")
+            if not name:
+                continue
+            try:
+                qty = max(1, int(float(low.get("count") or low.get("qty") or low.get("quantity") or 1)))
+            except ValueError:
+                qty = 1
+            entries.append({"qty": qty, "name": name, "set": low.get("set code", "").lower(),
+                            "number": low.get("card number", ""), "foil": low.get("foil", "").lower() in ("foil", "true", "1", "yes"),
+                            "section": "main"})
+        return entries
+    for ln in lines:
+        if not ln or ln.startswith(("//", "#")):
+            continue
+        if _SECTION_RE.match(ln):
+            section = ln.rstrip(":").strip().lower()
+            section = "side" if section.startswith(("side", "maybe", "consider")) else "main"
+            continue
+        sb = re.match(r"^SB:\s*(.*)$", ln, re.I)
+        sec = "side" if sb else section
+        e = _parse_card_line(sb.group(1) if sb else ln)
+        if e["name"]:
+            e["section"] = sec
+            entries.append(e)
+    return entries
+
+
+def compare_decklist(entries, owned_cards, include_side=True):
+    """What you own against a wanted list (by card name, any printing).
+    Returns {'rows': [...], 'need': n, 'have': n, 'short': n}; rows are missing first."""
+    owned = {}
+    for c in owned_cards:
+        owned[front_key(c["name"])] = owned.get(front_key(c["name"]), 0) + c["qty"]
+    need, names = {}, {}
+    for e in entries:
+        if e.get("section") == "side" and not include_side:
+            continue
+        k = front_key(e["name"])
+        need[k] = need.get(k, 0) + e["qty"]
+        names.setdefault(k, e["name"])
+    rows = []
+    for k, n in need.items():
+        have = owned.get(k, 0)
+        status = "have" if have >= n else ("some" if have else "missing")
+        rows.append({"name": names[k], "need": n, "have": have, "short": max(0, n - have), "status": status})
+    order = {"missing": 0, "some": 1, "have": 2}
+    rows.sort(key=lambda r: (order[r["status"]], r["name"].lower()))
+    return {"rows": rows, "need": sum(r["need"] for r in rows),
+            "have": sum(min(r["need"], r["have"]) for r in rows), "short": sum(r["short"] for r in rows)}
+
+
+def missing_text(rows):
+    return "\n".join(f"{r['short']} {r['name']}" for r in rows if r["short"])
+
+
+# ------------------------------------------------------------ deck statistics
+STAT_COLORS = ["W", "U", "B", "R", "G"]
+CURVE_MAX = 7
+
+
+def deck_stats(cards):
+    """Counts (by quantity) of colours, types, mana values and rarities, plus value facts."""
+    colors = {k: 0 for k in STAT_COLORS + ["Multi", "None"]}
+    types, rarity, curve = {}, {}, {i: 0 for i in range(CURVE_MAX + 1)}
+    unknown = 0
+    for c in cards:
+        q = c["qty"]
+        cols = [x for x in c.get("colors", []) if x in STAT_COLORS]
+        colors["Multi" if len(cols) > 1 else (cols[0] if cols else "None")] += q
+        t = main_type(c)
+        t = t if t in TYPE_FILTERS[1:] else "Other"
+        types[t] = types.get(t, 0) + q
+        r = (c.get("rarity") or "unknown").lower()
+        rarity[r] = rarity.get(r, 0) + q
+        if "land" in c.get("type_line", "").lower():
+            continue
+        if c.get("cmc") is None:
+            unknown += q
+        else:
+            curve[min(CURVE_MAX, int(c["cmc"]))] += q
+    ranked = sorted(cards, key=lambda c: -line_total(c))[:5]
+    return {"cards": sum(c["qty"] for c in cards), "unique": len(cards),
+            "foils": sum(c["qty"] for c in cards if c.get("finish") == "foil"),
+            "value": round(sum(line_total(c) for c in cards), 2),
+            "colors": colors, "types": types, "rarity": rarity, "curve": curve, "curve_unknown": unknown,
+            "top": [(c["name"], c["qty"], line_total(c)) for c in ranked]}
 
 
 # ------------------------------------------------------------------ webcam
@@ -3217,9 +3657,10 @@ class Banner:
     def layout(self):
         w = self.w or self.canvas.winfo_width()
         x = w - 24
-        for part, gap in reversed(self.items):
+        for i in range(len(self.items) - 1, -1, -1):
+            part = self.items[i][0]
             part.draw(x, self.HEIGHT // 2)
-            x -= part.width + gap
+            x -= part.width + (self.items[i - 1][1] if i > 0 else 0)    # gap after the part on its left
 
     def _on_resize(self, e):
         if self._resize_job:
@@ -3278,7 +3719,8 @@ class Banner:
         look = self.app.look
         style = PARTICLE_STYLES.get(look["theme"])
         w = int(self.w or self.canvas.winfo_width() or 0)
-        want = bool(look["animations"] and style and look["art"] != "none" and w > 20)
+        want = bool(look["animations"] and style and look["art"] != "none" and w > 20
+                    and PERF_LEVELS[getattr(self.app, "perf", "Smooth")]["art_motion"])
         for d in self.dots:
             self.canvas.delete(d)
         self.dots = []
@@ -4143,6 +4585,495 @@ def _num(value, default, lo, hi):
         return default
 
 
+def set_debug_keep(n):
+    global DEBUG_KEEP
+    DEBUG_KEEP = n
+
+
+def make_tree(parent, columns, heights=12):
+    """A list with a scroll bar: columns = [(key, heading, width, anchor)]. Returns the tree."""
+    frame = ttk.Frame(parent)
+    frame.pack(fill="both", expand=True)
+    frame.columnconfigure(0, weight=1)
+    frame.rowconfigure(0, weight=1)
+    tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=heights,
+                        selectmode="extended")
+    for key, text, width, anchor in columns:
+        tree.heading(key, text=text, anchor=anchor)
+        tree.column(key, width=width, anchor=anchor, stretch=(key == columns[0][0] or anchor == "w"))
+    sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=sb.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    sb.grid(row=0, column=1, sticky="ns")
+    return tree
+
+
+def when_text(t):
+    try:
+        return datetime.datetime.fromtimestamp(t).strftime("%b %d, %I:%M %p").replace(" 0", " ")
+    except (OSError, OverflowError, ValueError, TypeError):
+        return "?"
+
+
+class PricesWindow(tk.Toplevel):
+    """Refresh the prices in the current deck and see what has moved since the cards were added."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.configure(bg=C["bg"])
+        self.title("Prices")
+        self.transient(parent)
+        self.q = queue.Queue()
+        self.working = False
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"Prices - {app.deck}", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(body, style="Muted.TLabel", wraplength=560, justify="left", text=(
+            "Prices come from Scryfall, which updates them about once a day. Refreshing only changes "
+            "prices - your cards and counts stay as they are. A card's change is measured from its price "
+            "when it was added (for cards you already had, from the first refresh).")).pack(anchor="w", pady=(2, 10))
+        self.info = tk.StringVar()
+        ttk.Label(body, textvariable=self.info, font=F(11, "bold")).pack(anchor="w")
+        self.when = tk.StringVar()
+        ttk.Label(body, textvariable=self.when, style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(0, 10))
+        self.go = ttk.Button(row, text="Refresh prices now", style="Accent.TButton", command=self.start)
+        self.go.pack(side="left")
+        self.prog = tk.StringVar()
+        ttk.Label(row, textvariable=self.prog, style="Muted.TLabel").pack(side="left", padx=12)
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(0, 10))
+        ttk.Label(row, text="Highlight cards worth at least $", style="Muted.TLabel").pack(side="left")
+        self.alert = tk.StringVar(value=(f"{app.price_alert:g}" if app.price_alert else "0"))
+        e = ttk.Entry(row, textvariable=self.alert, width=8)
+        e.pack(side="left", padx=6)
+        e.bind("<Return>", lambda ev: self.set_alert())
+        ttk.Button(row, text="Set", style="Small.TButton", command=self.set_alert).pack(side="left")
+        ttk.Label(row, text="each   (0 = off)", style="Muted.TLabel").pack(side="left", padx=6)
+        ttk.Label(body, text="Biggest changes since added", style="Muted.TLabel").pack(anchor="w")
+        self.tree = make_tree(body, [("name", "Card", 220, "w"), ("qty", "Qty", 44, "e"), ("was", "Was", 70, "e"),
+                                     ("now", "Now", 70, "e"), ("chg", "Change", 80, "e"), ("tot", "Total change", 96, "e")], 10)
+        self.tree.tag_configure("up", foreground=C["good"])
+        self.tree.tag_configure("down", foreground=C["bad"])
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="Close", command=self.close).pack(side="right")
+        self.bind("<Escape>", lambda e: self.close())
+        self.fill()
+        center_on(self, parent)
+
+    def close(self):
+        self.app.prices_window = None
+        self.destroy()
+
+    def fill(self):
+        cards = self.app.cards
+        now, then, chg = value_summary(cards)
+        sign = "+" if chg >= 0 else "-"
+        self.info.set(f"{money(now)} now  -  {money(then)} when added  ({sign}{money(abs(chg))})")
+        t = last_price_check(cards)
+        self.when.set(f"Last refreshed: {when_text(t)}" if t else "Not refreshed yet.")
+        self.tree.delete(*self.tree.get_children())
+        movers = sorted((c for c in cards if abs(price_change(c)) >= 0.005),
+                        key=lambda c: -abs(price_change(c) * c["qty"]))[:100]
+        for c in movers:
+            d = price_change(c)
+            tot = d * c["qty"]
+            self.tree.insert("", "end", iid=c["id"], tags=("up" if d > 0 else "down",), values=(
+                c["name"], c["qty"], money(c["price"] - d), money(c["price"]), format_change(c),
+                ("+" if tot > 0 else "-") + money(abs(tot))))
+
+    def set_alert(self):
+        try:
+            v = float(self.alert.get().replace("$", "").strip() or 0)
+        except ValueError:
+            messagebox.showinfo(APP_NAME, "Type an amount like 5 or 2.50 (or 0 to turn it off).", parent=self)
+            return
+        self.app.set_option("price_alert", max(0.0, v))
+        self.app.refresh_table()
+        self.prog.set("Highlighting cards worth $%g or more." % v if v else "Highlight is off.")
+
+    def start(self):
+        if self.working or not self.app.cards:
+            if not self.app.cards:
+                self.prog.set("This deck has no cards yet.")
+            return
+        self.working = True
+        self.go.state(["disabled"])
+        self.deck = self.app.deck
+        idents = unique_identifiers(self.app.cards, set_code_map(self.app.sets))
+        self.prog.set("Asking Scryfall...")
+        q = self.q
+
+        def work():
+            try:
+                recs = fetch_price_records(idents, lambda d, t: q.put(("progress", d, t)))
+                q.put(("done", recs))
+            except ScryfallBusy as e:
+                q.put(("error", str(e)))
+            except Exception as e:  # noqa: BLE001
+                q.put(("error", f"Couldn't reach Scryfall ({type(e).__name__}). Check your internet and try again."))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self.poll)
+
+    def poll(self):
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        done = False
+        while True:
+            try:
+                msg = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if msg[0] == "progress":
+                self.prog.set(f"Checked {msg[1]} of {msg[2]} prices...")
+            elif msg[0] == "error":
+                self.prog.set(msg[1])
+                done = True
+            elif msg[0] == "done":
+                done = True
+                if self.app.deck != self.deck:
+                    self.prog.set("You switched decks while this ran, so nothing was changed. Try again.")
+                else:
+                    res = self.app.apply_prices(msg[1])
+                    moved = sum(1 for _c, o, n in res["changed"] if abs(n - o) >= 0.005)
+                    self.prog.set(f"Done - {len(res['changed'])} cards checked, {moved} changed"
+                                  + (f", {res['missing']} not found" if res["missing"] else "") + ".")
+                    self.fill()
+        if done:
+            self.working = False
+            self.go.state(["!disabled"])
+        else:
+            self.after(150, self.poll)
+
+
+class RecentWindow(tk.Toplevel):
+    """The last cards you added, each one can be taken back."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.configure(bg=C["bg"])
+        self.title("Recent adds")
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Recent adds", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(body, style="Muted.TLabel", wraplength=520, justify="left", text=(
+            "The last 20 cards you added, newest first. Undo takes back just that add "
+            "(a card you scanned twice goes back to one).")).pack(anchor="w", pady=(2, 10))
+        self.tree = make_tree(body, [("when", "When", 110, "w"), ("deck", "Deck", 100, "w"), ("name", "Card", 200, "w"),
+                                     ("qty", "Qty", 40, "e"), ("finish", "Finish", 70, "w")], 10)
+        self.msg = tk.StringVar()
+        ttk.Label(body, textvariable=self.msg, style="Muted.TLabel", wraplength=520, justify="left").pack(anchor="w", pady=(8, 0))
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Button(row, text="Close", command=self.close).pack(side="right")
+        ttk.Button(row, text="Undo selected", style="Accent.TButton", command=self.undo).pack(side="right", padx=(0, 8))
+        self.bind("<Escape>", lambda e: self.close())
+        self.fill()
+        center_on(self, parent)
+
+    def close(self):
+        self.app.recent_window = None
+        self.destroy()
+
+    def fill(self):
+        self.tree.delete(*self.tree.get_children())
+        for i, e in enumerate(self.app.recent):
+            self.tree.insert("", "end", iid=str(i), values=(
+                when_text(e.get("t", 0)), e["deck"], e["name"], e["qty"],
+                "Foil" if e.get("finish") == "foil" else "Non-foil"))
+        if not self.app.recent:
+            self.msg.set("Nothing to undo yet - cards you add will show up here.")
+
+    def undo(self):
+        sel = [int(i) for i in self.tree.selection()]
+        if not sel:
+            self.msg.set("Click the add you want to take back first.")
+            return
+        notes = []
+        for i in sorted(sel, reverse=True):        # newest index first keeps the others in place
+            ok, text = self.app.undo_entry(self.app.recent[i])
+            notes.append(text)
+        self.msg.set("  ".join(notes))
+        self.fill()
+
+
+class ImportWindow(tk.Toplevel):
+    """Paste a deck list from another site and see what you own and what you'd still need."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.configure(bg=C["bg"])
+        self.title("Import a list and compare")
+        self.transient(parent)
+        self.q = queue.Queue()
+        self.rows = []
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.scope = tk.StringVar(value="all")
+        self.side = tk.BooleanVar(value=True)
+        self.body = ttk.Frame(self, padding=18)
+        self.body.pack(fill="both", expand=True)
+        self._input()
+        center_on(self, parent)
+
+    def close(self):
+        self.app.import_window = None
+        self.destroy()
+
+    def _clear(self):
+        for w in self.body.winfo_children():
+            w.destroy()
+
+    def _input(self):
+        self._clear()
+        b = self.body
+        ttk.Label(b, text="Compare a deck list with your cards", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(b, style="Muted.TLabel", wraplength=560, justify="left", text=(
+            "Paste a list from Moxfield, Archidekt, Manabox, MTG Arena or a plain text list, one card "
+            "per line (like  4 Lightning Bolt  or  2 Forest (M20) 280). Your own CSV exports work too.")
+                  ).pack(anchor="w", pady=(2, 8))
+        self.text = tk.Text(b, width=64, height=14, wrap="none", bg=C["panel2"], fg=C["text"],
+                            insertbackground=C["text"], selectbackground=C["accent"], relief="flat",
+                            font=F(10), padx=8, pady=8, highlightthickness=1, highlightbackground=C["line"])
+        self.text.pack(fill="both", expand=True)
+        row = ttk.Frame(b)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Label(row, text="Compare with", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        ttk.Radiobutton(row, text="all my decks", value="all", variable=self.scope).pack(side="left")
+        ttk.Radiobutton(row, text="this deck only", value="this", variable=self.scope).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(row, text="include the sideboard", variable=self.side).pack(side="left", padx=(16, 0))
+        row = ttk.Frame(b)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="Compare", style="Accent.TButton", command=self.compare).pack(side="right")
+        ttk.Button(row, text="Close", command=self.close).pack(side="right", padx=(0, 8))
+        ttk.Button(row, text="Open a file...", command=self.open_file).pack(side="left")
+        self.bind("<Escape>", lambda e: self.close())
+        self.text.focus_set()
+
+    def open_file(self):
+        path = filedialog.askopenfilename(parent=self, title="Open a deck list",
+                                          filetypes=[("Text or CSV", "*.txt *.csv"), ("All files", "*.*")])
+        if path:
+            try:
+                data = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+            except OSError as e:
+                messagebox.showerror(APP_NAME, f"Couldn't open that file:\n{e}", parent=self)
+                return
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", data)
+
+    def compare(self):
+        entries = parse_decklist(self.text.get("1.0", "end"))
+        if not entries:
+            messagebox.showinfo(APP_NAME, "I couldn't find any cards in that. Paste a list with one card per line.", parent=self)
+            return
+        owned = list(self.app.cards)
+        if self.scope.get() == "all":
+            for n in list_decks():
+                if n != self.app.deck:
+                    owned += load_cards(deck_path(n))
+        self.cmp = compare_decklist(entries, owned, self.side.get())
+        self.rows = self.cmp["rows"]
+        self._results()
+        short = [r["name"] for r in self.rows if r["short"]]
+        self.prices = {}
+        if short:
+            self.sum_extra.set("Looking up prices for the missing cards...")
+            q = self.q
+
+            def work():
+                try:
+                    found = {}
+                    for i in range(0, len(short), 75):
+                        found.update(cards_by_names(short[i:i + 75]))
+                    q.put(("prices", found))
+                except Exception as e:  # noqa: BLE001
+                    q.put(("noprice", str(e)))
+
+            threading.Thread(target=work, daemon=True).start()
+            self.after(200, self._poll)
+
+    def _results(self):
+        self._clear()
+        b = self.body
+        c = self.cmp
+        pct = int(round(100.0 * c["have"] / c["need"])) if c["need"] else 100
+        ttk.Label(b, text=f"You have {c['have']} of the {c['need']} cards ({pct}%)", style="Section.TLabel").pack(anchor="w")
+        self.sum_extra = tk.StringVar(value="Nothing missing." if not c["short"] else f"Missing {c['short']} cards.")
+        ttk.Label(b, textvariable=self.sum_extra, style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w", pady=(2, 8))
+        self.tree = make_tree(b, [("status", "", 70, "w"), ("name", "Card", 250, "w"), ("need", "Need", 44, "e"),
+                                  ("have", "Have", 44, "e"), ("each", "Each", 64, "e"), ("cost", "To buy", 72, "e")], 14)
+        self.tree.tag_configure("missing", foreground=C["bad"])
+        self.tree.tag_configure("some", foreground=C["warn"])
+        self.tree.tag_configure("have", foreground=C["muted"])
+        label = {"have": "Have", "some": "Some", "missing": "Missing"}
+        for i, r in enumerate(self.rows):
+            self.tree.insert("", "end", iid=str(i), tags=(r["status"],), values=(
+                label[r["status"]], r["name"], r["need"], r["have"], "", ""))
+        row = ttk.Frame(b)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="Close", command=self.close).pack(side="right")
+        ttk.Button(row, text="Back", command=self._input).pack(side="right", padx=(0, 8))
+        ttk.Button(row, text="Save missing list...", command=self.save_missing).pack(side="left")
+        ttk.Button(row, text="Copy missing list", command=self.copy_missing).pack(side="left", padx=8)
+
+    def _poll(self):
+        try:
+            if not self.winfo_exists():
+                return
+            msg = self.q.get_nowait()
+        except queue.Empty:
+            self.after(200, self._poll)
+            return
+        except tk.TclError:
+            return
+        if msg[0] == "noprice":
+            self.sum_extra.set(f"Missing {self.cmp['short']} cards. (Prices couldn't be looked up right now.)")
+            return
+        total, unknown = 0.0, 0
+        for i, r in enumerate(self.rows):
+            if not r["short"]:
+                continue
+            rec = msg[1].get(r["name"]) or msg[1].get(r["name"].split(" // ")[0])
+            pr = (rec or {}).get("prices", {}) if rec else {}
+            each = _money(pr.get("usd") or pr.get("usd_foil") or pr.get("usd_etched"))
+            if not each:
+                unknown += 1
+                continue
+            total += each * r["short"]
+            if self.tree.exists(str(i)):
+                self.tree.set(str(i), "each", money(each))
+                self.tree.set(str(i), "cost", money(each * r["short"]))
+        self.sum_extra.set(f"Missing {self.cmp['short']} cards - about {money(total)} to buy one common printing of each"
+                           + (f" ({unknown} had no price)." if unknown else "."))
+
+    def copy_missing(self):
+        text = missing_text(self.rows)
+        if not text:
+            messagebox.showinfo(APP_NAME, "Nothing is missing.", parent=self)
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        messagebox.showinfo(APP_NAME, "Copied. Paste it into a store's list importer (TCGplayer, Card Kingdom, ...).", parent=self)
+
+    def save_missing(self):
+        text = missing_text(self.rows)
+        if not text:
+            messagebox.showinfo(APP_NAME, "Nothing is missing.", parent=self)
+            return
+        ensure_dirs()
+        path = filedialog.asksaveasfilename(parent=self, title="Save the missing list", defaultextension=".txt",
+                                            initialdir=str(EXPORT_DIR), initialfile="Missing cards.txt",
+                                            filetypes=[("Text", "*.txt")])
+        if path:
+            try:
+                Path(path).write_text(text + "\n", encoding="utf-8")
+            except OSError as e:
+                messagebox.showerror(APP_NAME, f"Couldn't save:\n{e}", parent=self)
+
+
+STAT_NAMES = {"W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green", "Multi": "Multicolor", "None": "Colorless"}
+STAT_HEX = {"W": "#f3efd2", "U": "#4aa3e8", "B": "#9a8fb0", "R": "#e0643c", "G": "#4cb86a", "Multi": "#ffd479", "None": "#a8adb8"}
+RARITY_HEX = {"common": "#b8bcc8", "uncommon": "#9fc5d9", "rare": "#ffd479", "mythic": "#e0643c"}
+
+
+class StatsWindow(tk.Toplevel):
+    """Colours, types, mana values, rarity and value of the open deck. Updates as the deck changes."""
+    W = 460
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.title("Deck stats")
+        self.configure(bg=C["bg"])
+        self.transient(parent)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.cv = tk.Canvas(self, width=self.W, height=400, bg=C["bg"], highlightthickness=0)
+        self.cv.pack()
+        self.bind("<Escape>", lambda e: self.close())
+        self.refresh()
+        center_on(self, parent)
+
+    def close(self):
+        self.app.stats_window = None
+        self.destroy()
+
+    def _title(self, y, text):
+        self.cv.create_text(18, y, anchor="w", text=text, fill=C["muted"], font=F(9, "bold"))
+        return y + 20
+
+    def _bars(self, y, rows):
+        peak = max([v for _l, v, _c in rows] + [1])
+        for label, v, color in rows:
+            self.cv.create_text(18, y + 9, anchor="w", text=label, fill=C["text"], font=F(10))
+            w = int((self.W - 200) * v / peak)
+            self.cv.create_rectangle(110, y + 2, 110 + max(w, 2 if v else 0), y + 16, fill=color, outline="")
+            self.cv.create_text(116 + w, y + 9, anchor="w", text=str(v), fill=C["muted"], font=F(9))
+            y += 22
+        return y + 8
+
+    def refresh(self):
+        st = deck_stats(self.app.cards)
+        cv = self.cv
+        cv.delete("all")
+        cv.configure(bg=C["bg"])
+        cv.create_text(18, 26, anchor="w", text=self.app.deck, fill=C["text"], font=F(14, "bold"))
+        cv.create_text(18, 50, anchor="w", fill=C["muted"], font=F(10), text=(
+            f"{st['cards']} cards ({st['unique']} different)   -   {money(st['value'])}"
+            + (f"   -   {st['foils']} foil" if st["foils"] else "")))
+        y = 78
+        if not st["cards"]:
+            cv.create_text(18, y + 10, anchor="w", text="No cards in this deck yet.", fill=C["muted"], font=F(10))
+            cv.configure(height=y + 40)
+            return
+        y = self._title(y, "COLOURS")
+        y = self._bars(y, [(STAT_NAMES[k], v, STAT_HEX[k]) for k, v in st["colors"].items() if v])
+        y = self._title(y, "CARD TYPES")
+        y = self._bars(y, [(k, v, C["accent"]) for k, v in sorted(st["types"].items(), key=lambda kv: -kv[1])])
+        y = self._title(y, "MANA VALUE (lands left out)")
+        curve = st["curve"]
+        peak = max(list(curve.values()) + [1])
+        colw = (self.W - 36) / (CURVE_MAX + 1)
+        base = y + 70
+        for i in range(CURVE_MAX + 1):
+            x0 = 18 + i * colw
+            h = int(60 * curve[i] / peak)
+            cv.create_rectangle(x0 + 6, base - h, x0 + colw - 6, base, fill=C["accent"], outline="")
+            if curve[i]:
+                cv.create_text(x0 + colw / 2, base - h - 8, text=str(curve[i]), fill=C["muted"], font=F(9))
+            cv.create_text(x0 + colw / 2, base + 12, text=(f"{i}+" if i == CURVE_MAX else str(i)), fill=C["text"], font=F(10))
+        y = base + 28
+        if st["curve_unknown"]:
+            cv.create_text(18, y, anchor="w", fill=C["muted"], font=F(9), text=(
+                f"{st['curve_unknown']} cards have no mana value saved yet - Prices > Refresh fills it in."))
+            y += 22
+        y += 6
+        y = self._title(y, "RARITY")
+        order = ["common", "uncommon", "rare", "mythic"]
+        rr = [(k.title(), st["rarity"][k], RARITY_HEX.get(k, C["muted"])) for k in order if st["rarity"].get(k)]
+        rr += [(k.title(), v, C["muted"]) for k, v in st["rarity"].items() if k not in order and v]
+        y = self._bars(y, rr)
+        y = self._title(y, "MOST VALUABLE")
+        for name, qty, tot in st["top"]:
+            cv.create_text(18, y + 9, anchor="w", text=(f"{qty}x " if qty > 1 else "") + name, fill=C["text"], font=F(10))
+            cv.create_text(self.W - 18, y + 9, anchor="e", text=money(tot), fill=C["gold"], font=F(10, "bold"))
+            y += 22
+        cv.configure(height=y + 14)
+
+
 class SettingsWindow(tk.Toplevel):
     """General options, scanning sensitivity and key binds. Changes apply at once."""
 
@@ -4168,6 +5099,7 @@ class SettingsWindow(tk.Toplevel):
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True)
         for title, build in (("General", self._general), ("Appearance", self._appearance),
+                             ("Performance", self._performance), ("Data", self._data),
                              ("Scanning", self._scanning), ("Keys", self._keys)):
             page = ttk.Frame(nb, style="Panel.TFrame", padding=18)
             nb.add(page, text=title)
@@ -4179,6 +5111,12 @@ class SettingsWindow(tk.Toplevel):
 
     def close(self):
         self._save_repo()
+        job = getattr(self, "_speed_job", None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:  # noqa: BLE001
+                pass
         self.app.settings_window = None
         self.destroy()
 
@@ -4298,6 +5236,170 @@ class SettingsWindow(tk.Toplevel):
                         command=lambda: app.set_look(sound=bool(v["sound"].get()))
                         ).pack(anchor="w", pady=(10, 0))
         ttk.Button(f, text="Reset appearance", command=self._reset_look).pack(anchor="w", pady=(12, 0))
+
+    def _data(self, f):
+        app = self.app
+        P, M = "Panel.TLabel", "PanelMuted.TLabel"
+        ttk.Label(f, text="Saving", style=P, font=F(11, "bold")).pack(anchor="w")
+        ttk.Label(f, style=M, wraplength=470, justify="left", text=(
+            "Your cards, decks and settings save by themselves every time something changes, so you "
+            "never need to save when you close the app. Backups are for moving to another computer or "
+            "for peace of mind.")).pack(anchor="w", pady=(2, 10))
+        self.scans_var = tk.BooleanVar(value=False)
+        self.auto_var = tk.BooleanVar(value=app.auto_backup_on)
+        row = ttk.Frame(f, style="Panel.TFrame")
+        row.pack(anchor="w")
+        ttk.Button(row, text="Back up now...", command=self._backup).pack(side="left")
+        ttk.Button(row, text="Restore from a backup...", command=self._restore).pack(side="left", padx=8)
+        ttk.Checkbutton(f, text="Include the scan pictures (makes the backup bigger)", variable=self.scans_var
+                        ).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(f, text="Also back up automatically when the app closes (keeps the newest 5)",
+                        variable=self.auto_var,
+                        command=lambda: app.set_option("auto_backup", bool(self.auto_var.get()))
+                        ).pack(anchor="w", pady=(4, 0))
+        ttk.Button(f, text="Open the backups folder", style="Small.TButton",
+                   command=lambda: (ensure_dirs(), BACKUP_DIR.mkdir(exist_ok=True), open_folder(BACKUP_DIR))
+                   ).pack(anchor="w", pady=(8, 0))
+
+        ttk.Label(f, text="Diagnostic pictures", style=P, font=F(11, "bold")).pack(anchor="w", pady=(18, 0))
+        ttk.Label(f, style=M, wraplength=470, justify="left", text=(
+            "When 'Save diagnostic pictures' is ticked on the main screen, every scan leaves a folder of "
+            "pictures behind. To stop them piling up, only the newest few are kept. Each scan (or each "
+            "card in a batch) counts as one.")).pack(anchor="w", pady=(2, 8))
+        labels = {n: (f"Keep the newest {n}" if n else "Keep all of them") for n in DEBUG_KEEP_CHOICES}
+        self._keep_labels = labels
+        self.keep_var = tk.StringVar(value=labels[load_keep(app.settings)])
+        row = ttk.Frame(f, style="Panel.TFrame")
+        row.pack(anchor="w")
+        cb = ttk.Combobox(row, textvariable=self.keep_var, values=[labels[n] for n in DEBUG_KEEP_CHOICES],
+                          state="readonly", width=20)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._keep_changed())
+        ttk.Button(row, text="Clean up now", style="Small.TButton", command=self._cleanup).pack(side="left", padx=8)
+        ttk.Button(row, text="Delete them all...", style="Small.TButton", command=self._delete_all).pack(side="left")
+        self.size_var = tk.StringVar()
+        ttk.Label(f, textvariable=self.size_var, style=P).pack(anchor="w", pady=(8, 0))
+        self._size()
+
+    def _size(self):
+        n = len(debug_runs(DEBUG_DIR))
+        self.size_var.set(f"Diagnostic pictures now use {format_size(dir_size(DEBUG_DIR))} in {n} scans."
+                          if DEBUG_DIR.exists() else "No diagnostic pictures saved.")
+
+    def _keep_n(self):
+        text = self.keep_var.get()
+        return next((n for n, t in self._keep_labels.items() if t == text), DEBUG_KEEP_DEFAULT)
+
+    def _keep_changed(self):
+        self.app.set_option("keep_diagnostics", self._keep_n())
+        self._size()
+
+    def _cleanup(self):
+        n = self._keep_n()
+        if not n:
+            self.size_var.set("'Keep all of them' is selected, so nothing was removed.")
+            return
+        gone, freed = prune_debug(DEBUG_DIR, n)
+        self._size()
+        self.size_var.set(self.size_var.get() + (f"  Removed {gone} old scans ({format_size(freed)})." if gone else ""))
+
+    def _delete_all(self):
+        runs = debug_runs(DEBUG_DIR)
+        if not runs:
+            self.size_var.set("There are no diagnostic scans to delete.")
+            return
+        if not messagebox.askyesno(APP_NAME, f"Delete all {len(runs)} diagnostic scans?\n\n"
+                                   "Your cards and decks are not touched.", parent=self):
+            return
+        for d in runs:
+            shutil.rmtree(d, ignore_errors=True)
+        self._size()
+
+    def _backup(self):
+        ensure_dirs()
+        start = Path.home() / "Documents"
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save a backup", defaultextension=".zip",
+            initialdir=str(start if start.exists() else Path.home()),
+            initialfile=f"MTG Card Scanner backup {datetime.datetime.now():%Y-%m-%d %H%M}.zip",
+            filetypes=[("Backup", "*.zip")])
+        if not path:
+            return
+        try:
+            self.app.save_cards()
+            n, size = make_backup(path, include_scans=bool(self.scans_var.get()))
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't save the backup:\n{e}", parent=self)
+            return
+        messagebox.showinfo(APP_NAME, f"Backed up {n} decks ({format_size(size)}) to:\n{path}", parent=self)
+
+    def _restore(self):
+        path = filedialog.askopenfilename(parent=self, title="Choose a backup",
+                                          filetypes=[("Backup", "*.zip"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            info = inspect_backup(path)
+        except BackupError as e:
+            messagebox.showerror(APP_NAME, str(e), parent=self)
+            return
+        listing = "\n".join(f"   {n}  ({c} cards)" for n, c in info["decks"].items())
+        clash = [n for n in info["decks"] if n in list_decks()]
+        if not messagebox.askyesno(APP_NAME, (
+                f"This backup has {len(info['decks'])} decks:\n{listing}\n\n"
+                + (f"Decks with the same name will be replaced: {', '.join(clash)}.\n" if clash else "")
+                + "Your other decks stay. A safety copy of what you have now is saved in the Backups "
+                  "folder first.\n\nRestore it?"), parent=self):
+            return
+        try:
+            res = restore_backup(path)
+        except (BackupError, OSError) as e:
+            messagebox.showerror(APP_NAME, f"Couldn't restore:\n{e}", parent=self)
+            return
+        self.app.after_restore(res)
+        messagebox.showinfo(APP_NAME, f"Restored {len(res['decks'])} decks.", parent=self)
+
+    def _performance(self, f):
+        app = self.app
+        self.perf_var = tk.StringVar(value=app.perf)
+        ttk.Label(f, text="How hard should the live picture work?", style="Panel.TLabel",
+                  font=F(11, "bold")).pack(anchor="w")
+        ttk.Label(f, style="PanelMuted.TLabel", wraplength=460, justify="left", text=(
+            "Pick a lighter level if the window stutters or the live picture lags. Reading a card "
+            "takes the same time at every level, and your results are not affected.")
+                  ).pack(anchor="w", pady=(2, 10))
+        for name in PERF_LEVELS:
+            ttk.Radiobutton(f, text=name, value=name, variable=self.perf_var,
+                            command=lambda: self._set_perf(), takefocus=0).pack(anchor="w", pady=(4, 0))
+            ttk.Label(f, text=PERF_TEXT[name], style="PanelMuted.TLabel", wraplength=430,
+                      justify="left").pack(anchor="w", padx=(24, 0))
+        ttk.Label(f, style="PanelMuted.TLabel", text=(
+            f"Suggested for this computer: {suggest_perf()}   ({os.cpu_count() or '?'} processor threads)")
+                  ).pack(anchor="w", pady=(12, 0))
+        self.speed_var = tk.StringVar()
+        ttk.Label(f, textvariable=self.speed_var, style="Panel.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(f, style="PanelMuted.TLabel", wraplength=460, justify="left", text=(
+            "Still slow? Open Camera on the main screen and choose 1280 x 720 (or 640 x 480) - "
+            "smaller pictures are much quicker to handle - and turn Animations off under Appearance."
+        )).pack(anchor="w", pady=(8, 0))
+        self._speed_tick()
+
+    def _set_perf(self):
+        self.app.set_perf(self.perf_var.get())
+
+    def _speed_tick(self):
+        try:
+            ms = self.app.perf_ms
+            lvl = PERF_LEVELS[self.app.perf]
+            if ms <= 0:
+                self.speed_var.set("Live picture speed: measuring...")
+            else:
+                verdict = ("fine" if ms < lvl["ms"] * 0.6 else
+                           "busy" if ms < lvl["ms"] else "too slow - try a lighter level")
+                self.speed_var.set(f"Live picture speed: {ms:.0f} ms per frame ({verdict})")
+            self._speed_job = self.after(1000, self._speed_tick)
+        except tk.TclError:
+            pass
 
     def _swatches(self):
         try:
@@ -4586,6 +5688,12 @@ class ScannerApp:
         self.read_number = bool(self.settings.get("read_number", True))
         self.number_first = bool(self.settings.get("number_first", True))
         self.commanders = clean_commanders(self.settings.get("commanders"), list_decks())
+        set_debug_keep(load_keep(self.settings))                  # tidy diagnostics: on by default
+        threading.Thread(target=lambda: prune_debug(DEBUG_DIR, DEBUG_KEEP), daemon=True).start()
+        self.auto_backup_on = bool(self.settings.get("auto_backup", False))
+        self.price_alert = _num(self.settings.get("price_alert", 0), 0.0, 0.0, 1_000_000.0)
+        self.recent = load_recent()
+        self.prices_window = self.recent_window = self.import_window = self.stats_window = None
         self.scan_action = tk.StringVar(value=self.settings.get("scan_action")
                                         if self.settings.get("scan_action") in dict(SCAN_ACTIONS) else "add")
         self.card_mode = tk.StringVar(value=self.settings.get("card_mode", "standard")
@@ -4613,7 +5721,9 @@ class ScannerApp:
         self.quad_motion = 999.0
         self.frame_count = 0
         self.sharp_avg = 0.0
-        self.frame_buffer = deque(maxlen=6)   # recent (sharpness, frame, quad)
+        self.perf = load_perf(self.settings)
+        self.perf_ms = 0.0                    # measured time to draw one live frame
+        self.frame_buffer = deque(maxlen=PERF_LEVELS[self.perf]["buffer"])   # recent (sharpness, frame, quad)
         self._pill_state = None
         self._seen_seq = -1
         self._opened_cam_settings = False
@@ -4653,8 +5763,8 @@ class ScannerApp:
         b_set = CanvasButton(head, "Settings", self.open_settings)
         self.update_btn = CanvasButton(head, "Check for updates", self.on_update_click)
         b_exit = CanvasButton(head, "Exit", self.on_close, "danger")
-        self.banner.set_right([(self.tile_count, 10), (self.tile_view, 10), (self.tile_all, 22),
-                               (b_set, 8), (self.update_btn, 8), (b_exit, 0)])
+        self.banner.set_right([(self.tile_count, 10), (self.tile_view, 10), (self.tile_all, 26),
+                               (b_set, 10), (self.update_btn, 22), (b_exit, 0)])
         root.after(200, self.banner.refresh)
 
         # ---- left: camera
@@ -4785,9 +5895,10 @@ class ScannerApp:
             c.pack(side="left", padx=(0, 14))
             c.bind("<<ComboboxSelected>>", self.on_filter_change)
 
-        cols = [("qty", "Qty", 42, "e"), ("name", "Name", 180, "w"), ("type", "Type", 80, "w"),
-                ("color", "Color", 78, "w"), ("set", "Set", 140, "w"),
-                ("finish", "Finish", 66, "w"), ("each", "Each", 62, "e"), ("value", "Total", 72, "e")]
+        cols = [("qty", "Qty", 42, "e"), ("name", "Name", 170, "w"), ("type", "Type", 74, "w"),
+                ("color", "Color", 70, "w"), ("set", "Set", 120, "w"),
+                ("finish", "Finish", 66, "w"), ("each", "Each", 62, "e"), ("chg", "Change", 62, "e"),
+                ("value", "Total", 72, "e")]
         tframe = ttk.Frame(panel, style="Panel.TFrame")
         tframe.grid(row=1, column=0, sticky="nsew")
         tframe.columnconfigure(0, weight=1)
@@ -4799,6 +5910,7 @@ class ScannerApp:
             self.tree.column(key, width=width, anchor=anchor, stretch=(key in ("name", "set")))
         self.tree.tag_configure("odd", background=C["stripe"])
         self.tree.tag_configure("foil", foreground=C["gold"])
+        self.tree.tag_configure("hot", foreground=C["warn"], font=F(10, "bold"))
         sb = ttk.Scrollbar(tframe, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -4822,7 +5934,14 @@ class ScannerApp:
         ttk.Button(btns2, text="\u2605 Commander", command=self.toggle_commander,
                    takefocus=0).pack(side="left", padx=(0, 6))
         ttk.Button(btns2, text="Export for websites...", command=self.export_sites,
+                   takefocus=0).pack(side="left", padx=(0, 6))
+        ttk.Button(btns2, text="Import a list...", command=self.open_import,
                    takefocus=0).pack(side="left")
+        btns3 = ttk.Frame(panel, style="Panel.TFrame")
+        btns3.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        for text, cmd in (("Deck stats", self.open_stats), ("Prices...", self.open_prices),
+                          ("Recent adds / Undo", self.open_recent)):
+            ttk.Button(btns3, text=text, command=cmd, takefocus=0).pack(side="left", padx=(0, 6))
 
         tk.Label(root, textvariable=self.status_var, anchor="w", bg=C["panel"],
                  fg=C["muted"], font=F(9), padx=22, pady=6).grid(
@@ -4850,11 +5969,29 @@ class ScannerApp:
         self.apply_focus()
 
     def update_preview(self):
+        lvl = PERF_LEVELS[self.perf]
+        if lvl["pause_busy"] and self.busy:           # don't compete with the card reader
+            self.root.after(150, self.update_preview)
+            return
+        t0 = time.perf_counter()
         try:
             self._update_preview_once()
         except Exception as e:  # keep the preview loop alive
             print("preview error:", e, file=sys.stderr)
-        self.root.after(33, self.update_preview)
+        took = (time.perf_counter() - t0) * 1000.0
+        self.perf_ms = took if self.perf_ms == 0 else 0.9 * self.perf_ms + 0.1 * took
+        self.root.after(max(5, lvl["ms"] - int(took)), self.update_preview)
+
+    def set_perf(self, level):
+        if level not in PERF_LEVELS:
+            return
+        self.perf = level
+        self.settings["performance"] = level
+        save_json(SETTINGS_FILE, self.settings)
+        self.frame_buffer = deque(list(self.frame_buffer)[-PERF_LEVELS[level]["buffer"]:],
+                                  maxlen=PERF_LEVELS[level]["buffer"])
+        if self.banner is not None:
+            self.banner.set_animation()
 
     def _show_message(self, text, pill_text):
         self.canvas.itemconfig(self.img_item, image="")
@@ -4892,7 +6029,8 @@ class ScannerApp:
 
         self.last_frame = frame
         self.frame_count += 1
-        if self.frame_count % 3 == 0:                     # look for the card outline
+        lvl = PERF_LEVELS[self.perf]
+        if self.frame_count % lvl["detect_every"] == 0:   # look for the card outline
             q = detect_card(frame)
             if q is not None:
                 self.quad_motion = float(np.abs(self.quad - q).max()) if self.quad is not None else 999.0
@@ -4901,7 +6039,7 @@ class ScannerApp:
                 self.quad, self.quad_miss = q.astype("float32"), 0
             else:
                 self.quad_miss += 1
-                if self.quad_miss > 6:
+                if self.quad_miss > max(2, 18 // lvl["detect_every"]):
                     self.quad = None
 
         region = region_for(frame, self.quad)
@@ -4919,7 +6057,8 @@ class ScannerApp:
 
         h, w = frame.shape[:2]
         scale = min(PREVIEW_W / w, PREVIEW_H / h)
-        small = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        small = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_LINEAR if lvl["fast_resize"] else cv2.INTER_AREA)
         self.draw_guide(small, state, scale)
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -5017,7 +6156,7 @@ class ScannerApp:
                 "phone": self.open_phone, "photo": self.scan_file, "add_name": self.add_by_name,
                 "qty_up": lambda: self.change_qty(1), "qty_down": lambda: self.change_qty(-1),
                 "new_deck": self.new_deck, "next_deck": self.next_deck, "flip": self.flip_selected, "remove": self.remove_selected,
-                "export_view": self.export_view, "export_all": self.export_all, "export_sites": self.export_sites,
+                "export_view": self.export_view, "export_all": self.export_all, "export_sites": self.export_sites, "undo": self.undo_last,
                 "settings": self.open_settings,
                 "update": lambda: self.start_update_check(True), "exit": self.on_close}
 
@@ -5106,6 +6245,16 @@ class ScannerApp:
             self.read_number = bool(value)
         elif name == "number_first":
             self.number_first = bool(value)
+        elif name == "keep_diagnostics":
+            set_debug_keep(load_keep({"keep_diagnostics": value}))
+            try:
+                prune_debug(DEBUG_DIR, DEBUG_KEEP)
+            except Exception:  # noqa: BLE001
+                pass
+        elif name == "auto_backup":
+            self.auto_backup_on = bool(value)
+        elif name == "price_alert":
+            self.price_alert = _num(value, 0.0, 0.0, 1_000_000.0)
 
     def set_look(self, **changes):
         """Change appearance settings, save them and show the result straight away."""
@@ -5130,6 +6279,7 @@ class ScannerApp:
             recolor_widgets(self.root, old, C)
             self.tree.tag_configure("odd", background=C["stripe"])
             self.tree.tag_configure("foil", foreground=C["gold"])
+            self.tree.tag_configure("hot", foreground=C["warn"], font=F(10, "bold"))
         except (tk.TclError, AttributeError):
             pass
         if self.banner is not None:
@@ -5137,7 +6287,7 @@ class ScannerApp:
 
     def flash_tiles(self):
         """A brief gold flash on the totals when a card is added (only with animations on)."""
-        if not self.look["animations"]:
+        if not self.look["animations"] or not PERF_LEVELS[self.perf]["art_motion"]:
             return
         try:
             for t in self.tiles:
@@ -5145,6 +6295,102 @@ class ScannerApp:
             self.root.after(450, lambda: [t.flash(False) for t in self.tiles])
         except (tk.TclError, AttributeError):
             pass
+
+    # ------------------------------------------------- prices, undo, import, stats
+    def _open_tool(self, attr, cls):
+        if self.busy:
+            return
+        win = getattr(self, attr)
+        if win is not None:
+            try:
+                win.lift()
+                return
+            except tk.TclError:
+                setattr(self, attr, None)
+        setattr(self, attr, cls(self.root, self))
+
+    def open_prices(self):
+        self._open_tool("prices_window", PricesWindow)
+
+    def open_recent(self):
+        self._open_tool("recent_window", RecentWindow)
+
+    def open_import(self):
+        self._open_tool("import_window", ImportWindow)
+
+    def open_stats(self):
+        self._open_tool("stats_window", StatsWindow)
+
+    def apply_prices(self, records):
+        res = apply_price_update(self.cards, records, set_code_map(self.sets))
+        self.save_cards()
+        self.refresh_table()
+        moved = sum(1 for _c, o, n in res["changed"] if abs(n - o) >= 0.005)
+        self.set_status(f"Prices refreshed: {len(res['changed'])} cards checked, {moved} changed.")
+        return res
+
+    def log_add(self, stored, card):
+        self.recent = add_recent(self.recent, self.deck, stored, card["qty"], card.get("image", ""))
+        try:
+            save_json(RECENT_FILE, self.recent)
+        except OSError:
+            pass
+
+    def undo_entry(self, entry):
+        """Take one recent add back. Returns (worked, sentence)."""
+        deck = entry["deck"]
+        if deck == self.deck:
+            cards = self.cards
+        elif deck_path(deck).exists():
+            cards = load_cards(deck_path(deck))
+        else:
+            self._forget_recent(entry)
+            return False, f"The deck {deck} no longer exists."
+        out = undo_add(cards, entry)
+        if out is None:
+            self._forget_recent(entry)
+            return False, f"{entry['name']} is no longer in {deck}, so there was nothing to undo."
+        if deck == self.deck:
+            self.cards = out["cards"]
+            self.save_cards()
+            self.refresh_table()
+        else:
+            save_json(deck_path(deck), out["cards"])
+        for f in out["drop_images"]:
+            try:
+                (SCANS_DIR / f).unlink()
+            except OSError:
+                pass
+        self._forget_recent(entry)
+        return True, f"Took back {entry['qty']}x {entry['name']} ({deck})."
+
+    def _forget_recent(self, entry):
+        self.recent = [e for e in self.recent if e is not entry]
+        try:
+            save_json(RECENT_FILE, self.recent)
+        except OSError:
+            pass
+
+    def undo_last(self):
+        if not self.recent:
+            self.set_status("Nothing to undo yet.")
+            return
+        ok, text = self.undo_entry(self.recent[0])
+        self.set_status(text)
+
+    def after_restore(self, res):
+        for deck, names in res["commanders"].items():
+            self.commanders[deck] = names
+        self._save_commanders()
+        names = list_decks()
+        if self.deck not in names:
+            self.deck = names[0]
+            self.settings["deck"] = self.deck
+            save_json(SETTINGS_FILE, self.settings)
+        self.cards = load_cards(deck_path(self.deck))      # not _open_deck: that would save the old copy over it
+        self._decks_changed()
+        self.refresh_table()
+        self.set_status(f"Restored {len(res['decks'])} decks from the backup.")
 
     def open_settings(self):
         if self.busy:
@@ -5305,11 +6551,13 @@ class ScannerApp:
                 tags.append("odd")
             if c["finish"] == "foil":
                 tags.append("foil")
+            if self.price_alert and c["price"] >= self.price_alert:
+                tags.append("hot")
             self.tree.insert("", "end", iid=c["id"], tags=tags, values=(
                 c["qty"], ("\u2605 " if any(front_key(n) == front_key(c["name"])
                                             for n in self.commanders.get(self.deck, [])) else "") + c["name"],
                 main_type(c), color_text(c), c["set"],
-                finish_text(c), money(c["price"]), money(line_total(c))))
+                finish_text(c), money(c["price"]), format_change(c), money(line_total(c))))
         keep = [i for i in keep_selection if self.tree.exists(i)]
         if keep:
             self.tree.selection_set(keep)
@@ -5318,6 +6566,11 @@ class ScannerApp:
         self.tile_count.set(f"{shown}" if shown == total else f"{shown} of {total}")
         self.tile_view.set(money(sum(line_total(c) for c in view)))
         self.tile_all.set(money(sum(line_total(c) for c in self.cards)))
+        if self.stats_window is not None:
+            try:
+                self.stats_window.refresh()
+            except tk.TclError:
+                self.stats_window = None
 
     def selected_cards(self):
         ids = set(self.tree.selection())
@@ -5518,6 +6771,7 @@ class ScannerApp:
 
         card["id"] = f"c{time.time_ns()}"
         card["scanned_at"] = time.time()
+        card["price_added"] = card["price"]
         card["image"] = ""
         if cards:
             try:  # keep a photo of the scan
@@ -5529,6 +6783,7 @@ class ScannerApp:
                 pass
         stored = self.add_to_collection(card)
         self.save_cards()
+        self.log_add(stored, card)
         self.refresh_table()
         self.flash_tiles()
         if self.look["sound"]:
@@ -5739,6 +6994,7 @@ class ScannerApp:
         ids = [c["id"] for c in sel]
         for c in sel:
             apply_finish(c, "nonfoil" if c["finish"] == "foil" else "foil")
+            c["price_added"] = c["price"]                 # the change is measured per finish
         self.save_cards()
         self.refresh_table(keep_selection=ids)
         self.set_status(f"Switched {len(sel)} card(s).")
@@ -5896,6 +7152,12 @@ class ScannerApp:
 
     # -------------------------------------------------------------- close
     def on_close(self):
+        try:
+            self.save_cards()
+            if self.auto_backup_on:
+                auto_backup()
+        except Exception:  # noqa: BLE001 - closing must never fail because of a backup
+            log_error("backup on close")
         if self.stream is not None:
             self.stream.stop()
         self.close_phone()

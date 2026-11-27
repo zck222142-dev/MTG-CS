@@ -183,6 +183,46 @@ Changes show straight away and are remembered.
 - **Sound**: an optional soft sound when a card is added (off by default).
 - **Reset appearance** puts everything back (your text size is kept).
 
+### Performance (Settings > Performance)
+
+If the window stutters or the live picture lags, pick a lighter level. It changes how much work the live picture does, not how cards are read, so results are the same.
+
+| Level | Live picture | Card outline checked | While a card is being read | Header motion |
+|---|---|---|---|---|
+| Smooth | about 30 frames a second | every 3rd frame | keeps moving | on |
+| Balanced | about 20 frames a second | every 4th frame | holds still | on |
+| Light | about 10 frames a second | every 8th frame | holds still | off |
+
+The app suggests a level for your computer the first time (older, two-thread machines get Light). The tab also shows how long each live frame takes right now. Still slow? Choose 1280 x 720 or 640 x 480 under Camera on the main screen, and turn Animations off under Appearance.
+
+### Prices, change and highlights
+
+Press **Prices...** under the list. **Refresh prices now** asks Scryfall for the current price of every card in the open deck (75 at a time) and changes only prices - your cards and counts stay as they are. Scryfall updates prices about once a day.
+
+- The list has a **Change** column: how each card's price has moved since you added it (cards you already had start being tracked from their first refresh).
+- The window lists the biggest movers and shows the deck's value now against when it was added.
+- **Highlight cards worth at least $** makes any card at or above that price show in bold orange in the list (0 turns it off).
+
+### Recent adds and Undo
+
+**Recent adds / Undo** (or **Ctrl+Z** for the very last one) lists the last 20 cards you added. Undo takes back just that add: a card you scanned twice goes back to one, and a card that was only added once is removed. It works across decks and survives closing the app.
+
+### Import a list and compare
+
+**Import a list...** takes a deck list pasted from Moxfield, Archidekt, Manabox, MTG Arena or a plain text list (`4 Lightning Bolt`, `2 Forest (M20) 280 *F*`, a Sideboard section, `SB:` lines), or one of this app's own CSV exports. It compares by card name, any printing, against all your decks or just the open one, and shows what you have, what you only partly have and what is missing, with the cost of the missing cards (one common printing each, so treat it as an estimate). **Copy missing list** or **Save missing list...** gives you a list to paste into a store.
+
+### Deck stats
+
+**Deck stats** opens a window beside the app that updates as the deck changes: colours, card types, mana values (lands left out), rarity, total value and the five most valuable cards. Mana values are saved for cards scanned from this version on; **Prices > Refresh** fills them in for older cards.
+
+### Backups and storage (Settings > Data)
+
+Your cards, decks and settings save by themselves every time something changes - you never need to save when you close the app.
+
+- **Back up now...** zips your decks and settings to a place you choose (optionally with the scan pictures). **Restore from a backup...** puts them back: decks with the same name are replaced, other decks stay, and a safety copy of what you had is saved in `Backups/` first.
+- **Also back up automatically when the app closes** (off by default) keeps the newest 5 in `Backups/`.
+- **Diagnostic pictures:** only the newest 20 diagnostic scans are kept by default (choose 5, 10, 20, 30 or all). Older ones are deleted automatically when the app starts and after each scan. The tab shows how much space they use and has **Clean up now** and **Delete them all...**. Your cards and decks are never touched.
+
 ### Settings and key binds
 Click **Settings** (or press **Ctrl+comma**).
 
@@ -191,7 +231,7 @@ Click **Settings** (or press **Ctrl+comma**).
   ready. The small `focus` number under the camera shows what your camera reaches.
 - **Keys:** every action can have its own key. Defaults: Space snap, A switch Manual/Auto,
   S scan action, B batch mode, C commander, Ctrl+N new deck, D next deck, T switch Non-foil/Foil for new scans, M switch Standard/Land/Token, P phone, O photo file, N add by name or number,
-  + and - change quantity, F switch foil, Delete remove, Ctrl+E export view, Ctrl+Q exit.
+  + and - change quantity, F switch foil, Delete remove, Ctrl+E export view, Ctrl+Z undo the last card added, Ctrl+Q exit.
   Single-letter keys are ignored while you are typing in a box.
 
 ### Exit
@@ -256,7 +296,10 @@ source.
 | `Exports/` | Default place for exported text files |
 | `card_names.json` | Cached list of card names |
 | `PhoneCertificate/` | The phone link's certificate and private key |
-| `Debug/` | Only exists if you turn on *Save diagnostic pictures* |
+| `Debug/` | Only exists if you turn on *Save diagnostic pictures*. Only the newest scans are kept (Settings > Data) |
+| `Backups/` | Safety copies made before a restore and automatic backups (if turned on) |
+| `recent_adds.json` | The last 20 adds, for Undo |
+| `error log.txt` | Only exists if something went wrong; send it if you report a problem |
 
 ---
 
